@@ -1,0 +1,73 @@
+import { SlashCommandBuilder, MessageFlags } from 'discord.js';
+import * as verificationService from '../../../services/verification.service.js';
+import { infoEmbed, warningEmbed } from '../../embedBuilders.js';
+import logger from '../../../config/logger.js';
+
+export const data = new SlashCommandBuilder()
+  .setName('link')
+  .setDescription('Link your Discord account to a Roblox account.')
+  .addStringOption((opt) =>
+    opt
+      .setName('roblox_username')
+      .setDescription('Your exact Roblox username')
+      .setRequired(true)
+      .setMinLength(3)
+      .setMaxLength(20)
+  )
+  .toJSON();
+
+export const meta = {
+  // Anyone can link — no permission required.
+  cooldownSeconds: 30,
+};
+
+export async function execute(interaction) {
+  const username = interaction.options.getString('roblox_username', true);
+
+  const { verification, robloxUser } = await verificationService.startVerification(
+    interaction.user.id,
+    username
+  );
+
+  // Build the instructions the user needs. This message contains the
+  // code, so it is delivered both as an ephemeral reply AND a DM.
+  const instructions = [
+    `**Hi ${interaction.user.username}!** Here's how to finish linking:`,
+    '',
+    `**1.** Open your Roblox profile:`,
+    `    https://www.roblox.com/users/${robloxUser.id}/profile`,
+    '',
+    `**2.** Click **Edit Profile** and paste this code somewhere in your **About** section:`,
+    '',
+    `      \`${verification.code}\``,
+    '',
+    `**3.** Save your profile, then run \`/verify\` here.`,
+    '',
+    `**This code expires in 30 minutes.** If it expires, run \`/link\` again.`,
+  ].join('\n');
+
+  const embed = infoEmbed({
+    title: 'Roblox Account Linking',
+    description: instructions,
+    fields: [
+      {
+        name: 'Matched Roblox Account',
+        value: `**${robloxUser.name}** (ID: \`${robloxUser.id}\`)`,
+        inline: false,
+      },
+    ],
+  });
+
+  // Ephemeral reply always.
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+
+  // Try to DM the same content. Failure is non-fatal.
+  try {
+    await interaction.user.send({ embeds: [embed] });
+  } catch (err) {
+    logger.debug(
+      { discordId: interaction.user.id, err: err.message },
+      'Could not DM verification code (user has DMs closed)'
+    );
+  }
+}

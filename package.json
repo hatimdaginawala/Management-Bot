@@ -1,0 +1,36 @@
+{
+  "name": "24th-guard-rifles-bot",
+  "version": "1.0.0",
+  "description": "Discord-based management system for the 24th Guard Rifles Roblox group",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+"scripts": {
+  "start": "node src/server.js",
+  "dev": "node src/server.js",
+  "deploy:commands": "node src/bot/deployCommands.js",
+  "seed": "node scripts/seedAll.js",
+  "test": "set NODE_OPTIONS=--experimental-vm-modules&& node node_modules/jest/bin/jest.js",
+  "lint": "echo lint-not-configured"
+},
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^8.0.0",
+    "mongoose": "^8.24.5",
+    "node-cron": "^3.0.3",
+    "pino": "^9.4.0",
+    "pino-http": "^10.3.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "mongodb-memory-server": "^10.0.0",
+    "pino-pretty": "^11.2.2"
+  }
+}
