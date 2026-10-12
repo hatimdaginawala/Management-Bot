@@ -11,10 +11,10 @@ import * as permissionService from '../../services/permission.service.js';
 import * as settingsService from '../../services/settings.service.js';
 import { successEmbed, errorEmbed, infoEmbed, COLORS } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import logger from '../../config/logger.js';
 
-export const customId = ['event:approve:*', 'event:reject:*', 'event:details:*'];
+export const customId = ['event:approve:*', 'event:reject:*'];
 export const meta = {};
 
 export async function execute(interaction) {
@@ -31,14 +31,9 @@ export async function execute(interaction) {
 
 async function handleApprove(interaction, eventId) {
   const perm = await checkPermission(interaction.user.id, 'events.approve');
-  if (!perm) {
-    throw new AuthorizationError('You do not have permission to approve events.');
-  }
+  if (!perm) throw new AuthorizationError('You do not have permission to approve events.');
 
-  const { event, alreadyApproved } = await eventService.approveEvent(
-    interaction.user.id,
-    eventId
-  );
+  const { event, alreadyApproved } = await eventService.approveEvent(interaction.user.id, eventId);
 
   try {
     const originalEmbed = interaction.message?.embeds?.[0];
@@ -55,10 +50,7 @@ async function handleApprove(interaction, eventId) {
 
   if (alreadyApproved) {
     return interaction.reply({
-      embeds: [infoEmbed({
-        title: 'Already Approved',
-        description: 'This event was already approved.',
-      })],
+      embeds: [infoEmbed({ title: 'Already Approved', description: 'This event was already approved.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -70,11 +62,11 @@ async function handleApprove(interaction, eventId) {
     extraLine: 'Your event has been approved. Attendance has been credited.',
   });
 
-  const ts = Math.floor(new Date(event.createdAt).getTime() / 1000);
+  const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
   return interaction.reply({
     embeds: [successEmbed({
       title: 'Event Approved',
-      description: 'Approved **' + event.eventTypeKey + '** hosted by <@' + event.host.discordId + '> (logged <t:' + ts + ':R>).',
+      description: 'Approved **' + event.event_type_key + '** hosted by <@' + event.host_discord_id + '> (logged <t:' + ts + ':R>).',
       fields: [
         { name: 'Attendees Credited', value: String(event.attendeeEntries.length), inline: true },
       ],
@@ -85,9 +77,7 @@ async function handleApprove(interaction, eventId) {
 
 async function handleReject(interaction, eventId) {
   const perm = await checkPermission(interaction.user.id, 'events.reject');
-  if (!perm) {
-    throw new AuthorizationError('You do not have permission to reject events.');
-  }
+  if (!perm) throw new AuthorizationError('You do not have permission to reject events.');
 
   const modal = new ModalBuilder()
     .setCustomId('modal:event-reject:' + eventId)
@@ -122,7 +112,7 @@ export async function dmHost(client, event, {
       return;
     }
 
-    const hostId = event?.host?.discordId;
+    const hostId = event?.host_discord_id;
     if (!hostId) {
       logger.debug('DM to host skipped: no host discordId');
       return;
@@ -137,10 +127,10 @@ export async function dmHost(client, event, {
       return;
     }
 
-    const ts = Math.floor(new Date(event.createdAt).getTime() / 1000);
+    const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
 
     const fields = [
-      { name: 'Type', value: '`' + event.eventTypeKey + '`', inline: true },
+      { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
       { name: 'Logged', value: '<t:' + ts + ':R>', inline: true },
       { name: 'Attendees', value: String(event.attendeeEntries.length), inline: true },
     ];
@@ -169,20 +159,20 @@ export async function dmHost(client, event, {
     logger.info({ hostId, title }, 'Event outcome DM sent');
   } catch (err) {
     logger.warn(
-      { err: err.message, hostId: event?.host?.discordId },
+      { err: err.message, hostId: event?.host_discord_id },
       'Could not DM event outcome (user may have DMs closed)'
     );
   }
 }
 
 function parseAction(customId) {
-  const m = /^event:(approve|reject):([a-f0-9]{24})$/.exec(customId);
+  const m = /^event:(approve|reject):(\d+)$/.exec(customId);
   if (!m) return null;
   return { kind: m[1], eventId: m[2] };
 }
 
 async function checkPermission(discordId, permissionKey) {
-  const user = await User.findOne({ discordId });
+  const user = await userRepo.findByDiscordId(discordId);
   if (!user) return false;
-  return permissionService.hasPermission(user._id, permissionKey);
+  return permissionService.hasPermission(user.id, permissionKey);
 }

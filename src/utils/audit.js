@@ -1,18 +1,14 @@
-import { AuditLog } from '../models/index.js';
+import * as auditLogRepo from '../db/repositories/auditLog.repository.js';
 import logger from '../config/logger.js';
 
 /**
  * Write an audit-log entry.
  *
- * Phase 3: real write to the AuditLog collection.
- * Phase 16: will add enrichment (actor username lookup, IP capture,
- *           channel context, batch writes) without changing this signature.
- *
- * Never throws into the caller. If audit logging fails, the failure is
- * logged but the original operation is NOT rolled back — audit is
- * best-effort observability, not a transaction. This is documented in
- * `.txt` §35 ("every important administrative action must be audited")
- * with the pragmatic caveat that audit failures must not break the app.
+ * Best-effort: never throws into the caller. If the write fails, the
+ * failure is logged but the original operation is NOT rolled back.
+ * This is documented in .txt §35 — every important administrative
+ * action must be audited, with the pragmatic caveat that audit
+ * failures must not break the app.
  */
 export async function audit({
   actorId,
@@ -26,7 +22,7 @@ export async function audit({
   context = null,
 }) {
   try {
-    await AuditLog.create({
+    await auditLogRepo.create({
       actorId: actorId || 'system',
       action,
       category,

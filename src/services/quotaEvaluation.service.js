@@ -1,63 +1,44 @@
-import {
-  User,
-  Leave,
-  Event,
-  QuotaResult,
-  QuotaPeriod,
-  Strike,
-} from '../models/index.js';
-import { audit } from '../utils/audit.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as leaveRepo from '../db/repositories/leave.repository.js';
+import * as noticeRepo from '../db/repositories/notice.repository.js';
+import * as eventRepo from '../db/repositories/event.repository.js';
+import * as attendanceRepo from '../db/repositories/attendance.repository.js';
+import * as quotaResultRepo from '../db/repositories/quotaResult.repository.js';
+import * as quotaPeriodRepo from '../db/repositories/quotaPeriod.repository.js';
+import * as strikeRepo from '../db/repositories/strike.repository.js';
 import {
   getPeriodByKey,
   acquireClosingLock,
   finalizePeriod,
   openNextPeriod,
 } from './quotaPeriod.service.js';
-import { countAttendanceForUser } from './attendance.service.js';
+import { audit } from '../utils/audit.js';
+import { db } from '../db/client.js';
 import logger from '../config/logger.js';
 
 /**
- * Weekly quota evaluation.
+ * Weekly quota evaluation. Public API unchanged.
  *
- * Idempotency chain (no transactions):
- *   1. acquireClosingLock(key) — CAS: OPEN → CLOSING.
- *      If null, another worker is evaluating. Return early.
- *   2. For each user:
- *      a. QuotaResult.updateOne(..., { upsert: true }) — one row per
- *         (user, period, category).
- *      b. Only the caller who created the row (upsertedCount === 1)
- *         issues a strike or applies recovery.
- *   3. Strike partial-unique (user, quotaPeriodKey, type) — the DB
- *      refuses a duplicate strike even if (a) and (b) both misfire.
+ * Idempotency:
+ *   1. acquireClosingLock CAS on quota_periods.status OPEN → CLOSING.
+ *   2. ensureResult on quota_results (user, period, category) — only the
+ *      creator issues a strike or applies a recovery.
+ *   3. strikeRepo.ensureQuotaStrike — belt-and-suspenders.
  *
- * Strike issuance is delegated to strikeService, imported lazily so
- * tests can mock it. Phase 10 provides the real implementation.
+ * `onStrikeIssued` is the callback the job passes to fire DMs.
  */
 
-let strikeService = null;
-async function getStrikeService() {
-  if (!strikeService) {
-    strikeService = await import('./strike.service.js');
-  }
-  return strikeService;
-}
-
-const MAX_PERIOD_RESULTS = 100_000; // sanity cap
+const MAX_PERIOD_RESULTS = 100_000;
 
 // ============================================================
 //  Public entry point
 // ============================================================
 
-/**
- * Evaluate a quota period by its key.
- *
- * @param {string} periodKey    e.g. "2026-W41"
- * @param {object} opts
- * @param {string} [opts.actorId]  "system" or a discordId
- * @param {boolean}[opts.dryRun]   if true, do not issue strikes/recoveries
- * @returns {Promise<{status, evaluated, strikesIssued, recoveriesApplied, skipped}>}
- */
-export async function evaluatePeriod(periodKey, { actorId = 'system', dryRun = false, onStrikeIssued = null } = {}) {
+export async function evaluatePeriod(periodKey, {
+  actorId = 'system',
+  dryRun = false,
+  onStrikeIssued = null,
+} = {}) {
   const period = await getPeriodByKey(periodKey);
 
   if (period.status === 'CLOSED') {
@@ -65,7 +46,6 @@ export async function evaluatePeriod(periodKey, { actorId = 'system', dryRun = f
     return { status: 'ALREADY_CLOSED', evaluated: 0, strikesIssued: 0, recoveriesApplied: 0, skipped: 0 };
   }
 
-  // CAS: OPEN → CLOSING. If someone else got here first, exit.
   const locked = await acquireClosingLock(periodKey);
   if (!locked) {
     logger.info({ periodKey, status: period.status }, 'Period not OPEN — skipping');
@@ -79,38 +59,34 @@ export async function evaluatePeriod(periodKey, { actorId = 'system', dryRun = f
       (locked.policies ?? []).map((p) => [p.category, p])
     );
 
-    // Fetch eligible users. category ∈ {STAFF, LOW_RANK}, status ACTIVE.
-    const eligible = await User.find({
+    // Eligible users
+    const { items: eligible } = await userRepo.list({
       status: 'ACTIVE',
-      'quota.category': { $in: ['STAFF', 'LOW_RANK'] },
-    })
-      .select('_id discordId quota roblox')
-      .lean();
+      quotaCategory: undefined,
+      page: 1,
+      pageSize: MAX_PERIOD_RESULTS,
+    });
 
-    if (eligible.length > MAX_PERIOD_RESULTS) {
-      logger.warn(
-        { periodKey, eligible: eligible.length },
-        'Eligible user count exceeds sanity cap — proceeding anyway'
-      );
-    }
+    const eligibleUsers = eligible.filter((u) =>
+      u.quota_category === 'STAFF' || u.quota_category === 'LOW_RANK'
+    );
 
-    // Pre-fetch leaves overlapping the period once.
-    const overlappingLeaves = await Leave.find({
-      status: 'APPROVED',
-      startAt: { $lt: locked.endAt },
-      endAt: { $gt: locked.startAt },
-    })
-      .select('user')
-      .lean();
-    const onLeave = new Set(overlappingLeaves.map((l) => String(l.user)));
+    // Leaves overlapping the period
+    const leaveUserIds = await leaveRepo.findOverlappingApprovedInPeriod(locked);
+    const onLeave = new Set(leaveUserIds.map(String));
 
-    for (const user of eligible) {
+    // Quota-exempting notices overlapping the period
+    const noticeUserIds = await noticeRepo.findActiveExemptOverlappingPeriod(locked);
+    const hasNotice = new Set(noticeUserIds.map(String));
+
+    for (const user of eligibleUsers) {
       try {
         const result = await evaluateOneUser({
           user,
           period: locked,
           policyByCategory,
           onLeave,
+          hasNotice,
           dryRun,
           onStrikeIssued,
         });
@@ -120,20 +96,18 @@ export async function evaluatePeriod(periodKey, { actorId = 'system', dryRun = f
       } catch (err) {
         stats.skipped++;
         logger.error(
-          { err: err.message, userId: String(user._id), periodKey },
+          { err: err.message, userId: user.id, periodKey },
           'Evaluation failed for user — continuing'
         );
       }
     }
 
-    // Finalize.
     await finalizePeriod(periodKey, {
       evaluatedCount: stats.evaluated,
       strikesIssuedCount: stats.strikesIssued,
       recoveriesAppliedCount: stats.recoveriesApplied,
     });
 
-    // Open the next period.
     await openNextPeriod(periodKey, { actorId });
 
     await audit({
@@ -141,15 +115,13 @@ export async function evaluatePeriod(periodKey, { actorId = 'system', dryRun = f
       action: 'quota.period_evaluated',
       category: 'QUOTA',
       targetType: 'QuotaPeriod',
-      targetId: locked._id,
+      targetId: locked.id,
       after: { periodKey, ...stats, dryRun },
     });
 
     logger.info({ periodKey, ...stats }, 'Quota period evaluated');
-
     return { status: 'EVALUATED', ...stats };
   } catch (err) {
-    // If we bailed, we might have left the period in CLOSING.
     logger.error({ err: err.message, periodKey }, 'Quota evaluation failed');
     throw err;
   }
@@ -164,82 +136,67 @@ async function evaluateOneUser({
   period,
   policyByCategory,
   onLeave,
+  hasNotice,
   dryRun,
+  onStrikeIssued,
 }) {
-  const category = user.quota?.category;
+  const category = user.quota_category;
   if (category !== 'STAFF' && category !== 'LOW_RANK') {
     return { strikeIssued: false, recoveriesApplied: 0 };
   }
 
   const policy = policyByCategory.get(category);
-  if (!policy) {
-    // No policy for this category — nothing to evaluate.
-    return { strikeIssued: false, recoveriesApplied: 0 };
-  }
+  if (!policy) return { strikeIssued: false, recoveriesApplied: 0 };
 
   // ---------- Exemption checks ----------
   const isExempt = evaluateExemption(user, period);
-  const isOnLeave = onLeave.has(String(user._id));
+  const isOnLeave = onLeave.has(String(user.id));
+  const hasExemptNotice = hasNotice.has(String(user.id));
 
-  // ---------- Metric ----------
   let actual = 0;
   let status = 'MISSED';
   let exemptReason = null;
 
-  if (isExempt || isOnLeave) {
+  if (isExempt) {
     status = 'EXEMPT';
-    exemptReason = isExempt ? 'MANUAL' : 'LEAVE';
+    exemptReason = 'MANUAL';
+  } else if (isOnLeave) {
+    status = 'EXEMPT';
+    exemptReason = 'LEAVE';
+  } else if (hasExemptNotice) {
+    status = 'EXEMPT';
+    exemptReason = 'NOTICE';
   } else {
-    actual = await countMetric({
-      user,
-      metric: policy.metric,
-      period,
-    });
+    actual = await countMetric({ user, metric: policy.metric, period });
     status = actual >= policy.amount ? 'MET' : 'MISSED';
   }
 
   // ---------- Idempotency anchor ----------
-  // Upsert: only the caller who created the row proceeds to strike/recovery.
-  const upsertResult = await QuotaResult.updateOne(
-    { user: user._id, period: period._id, category },
-    {
-      $setOnInsert: {
-        period: period._id,
-        periodKey: period.periodKey,
-        user: user._id,
-        discordId: user.discordId,
-        category,
-        metric: policy.metric,
-        required: policy.amount,
-        actual,
-        status,
-        exemptReason,
-        strikeIssued: false,
-        recoveryApplied: false,
-        recoveriesCount: 0,
-        evaluatedAt: new Date(),
-      },
-    },
-    { upsert: true }
-  );
+  const { created, row: result } = await quotaResultRepo.ensureResult({
+    periodId: period.id,
+    periodKey: period.periodKey,
+    userId: user.id,
+    discordId: user.discord_id,
+    category,
+    metric: policy.metric,
+    requiredAmount: policy.amount,
+    actualAmount: actual,
+    status,
+    exemptReason,
+  });
 
-  const weCreatedRow = upsertResult.upsertedCount === 1;
-
-  if (!weCreatedRow) {
-    // Someone already evaluated this user for this period.
+  if (!created) {
     return { strikeIssued: false, recoveriesApplied: 0 };
   }
-
-  // ---------- Strikes / recoveries ----------
 
   if (status === 'EXEMPT') {
     return { strikeIssued: false, recoveriesApplied: 0 };
   }
 
   if (status === 'MET') {
-    // Recovery: floor(actual / (2 * required)).
     const threshold = policy.recoveryMultiplier * policy.amount;
     const recoveries = threshold > 0 ? Math.floor(actual / threshold) : 0;
+
     if (recoveries > 0 && !dryRun) {
       const applied = await applyRecoveries({
         user,
@@ -247,14 +204,11 @@ async function evaluateOneUser({
         count: recoveries,
       });
       if (applied > 0) {
-        await QuotaResult.updateOne(
-          { user: user._id, period: period._id, category },
-          {
-            $set: {
-              recoveryApplied: true,
-              recoveriesCount: applied,
-            },
-          }
+        await quotaResultRepo.markRecoveriesApplied(
+          user.id,
+          period.id,
+          category,
+          applied
         );
         return { strikeIssued: false, recoveriesApplied: applied };
       }
@@ -265,24 +219,21 @@ async function evaluateOneUser({
   if (status === 'MISSED') {
     if (dryRun) return { strikeIssued: false, recoveriesApplied: 0 };
 
-    // Issue one strike. strikeService is idempotent via partial-unique.
-    const { issueQuotaStrike } = await getStrikeService();
-    const result = await issueQuotaStrike({
-      user,
-      period,
-      reason: `Missed ${category} quota: required ${policy.amount} ${policy.metric}, achieved ${actual}.`,
+    const { created: strikeCreated, row: strike } = await strikeRepo.ensureQuotaStrike({
+      userId: user.id,
+      discordId: user.discord_id,
+      quotaPeriodKey: period.periodKey,
+      reason:
+        'Missed ' + category + ' quota: required ' + policy.amount + ' ' +
+        policy.metric + ', achieved ' + actual + '.',
     });
 
-    if (result.created) {
-      await QuotaResult.updateOne(
-        { user: user._id, period: period._id, category },
-        { $set: { strikeIssued: true } }
-      );
+    if (strikeCreated) {
+      await quotaResultRepo.markStrikeIssued(user.id, period.id, category);
 
-      // Fire the notification hook (if provided) so the caller can DM.
       if (typeof onStrikeIssued === 'function') {
         try {
-          await onStrikeIssued({ user, strike: result.strike, period });
+          await onStrikeIssued({ user, strike, period });
         } catch (err) {
           logger.warn({ err: err.message }, 'onStrikeIssued callback failed');
         }
@@ -291,7 +242,6 @@ async function evaluateOneUser({
       return { strikeIssued: true, recoveriesApplied: 0 };
     }
 
-    // Strike already existed (idempotent path).
     return { strikeIssued: false, recoveriesApplied: 0 };
   }
 
@@ -302,65 +252,37 @@ async function evaluateOneUser({
 //  Helpers
 // ============================================================
 
-/**
- * Count the metric for a user in the given period.
- * Returns an integer.
- */
 async function countMetric({ user, metric, period }) {
   if (metric === 'HOSTED_EVENTS') {
-    return Event.countDocuments({
-      'host.discordId': user.discordId,
-      status: 'APPROVED',
-      cooldownAnchor: { $gte: period.startAt, $lt: period.endAt },
+    return eventRepo.countApprovedByHostInRange(user.discord_id, {
+      from: period.start_at,
+      to: period.end_at,
     });
   }
   if (metric === 'ATTENDED_EVENTS') {
-    return countAttendanceForUser(user._id, {
-      from: period.startAt,
-      to: period.endAt,
+    return attendanceRepo.countActiveForUserInRange(user.id, {
+      from: period.start_at,
+      to: period.end_at,
     });
   }
-  throw new Error(`Unknown metric: ${metric}`);
+  throw new Error('Unknown metric: ' + metric);
 }
 
-/**
- * Effective exemption check (D4).
- * - `quota.exempt === true`
- * - AND (`quota.exemptUntil === null` OR `quota.exemptUntil > period.endAt`)
- *
- * We compare against `period.endAt`, not now, so an exemption that
- * expires mid-week still exempts the whole week (D4).
- */
 function evaluateExemption(user, period) {
-  if (!user.quota?.exempt) return false;
-  const until = user.quota?.exemptUntil;
+  if (!user.quota_exempt) return false;
+  const until = user.quota_exempt_until;
   if (!until) return true;
-  return new Date(until) > new Date(period.endAt);
+  return new Date(until) > new Date(period.end_at);
 }
 
-/**
- * Apply `count` recoveries to the user's ACTIVE strikes (oldest first).
- * Returns the number actually applied.
- *
- * Idempotent per (strike, period): the same strike cannot be recovered
- * twice in the same period because we filter on `status: 'ACTIVE'`.
- */
 async function applyRecoveries({ user, period, count }) {
   let applied = 0;
   while (applied < count) {
-    const strike = await Strike.findOneAndUpdate(
-      { user: user._id, status: 'ACTIVE' },
-      {
-        $set: {
-          status: 'RECOVERED',
-          resolvedAt: new Date(),
-          resolvedBy: 'system:quota-recovery',
-          recoveredInPeriodKey: period.periodKey,
-          resolutionReason: `Recovered via double-quota in ${period.periodKey}.`,
-        },
-      },
-      { sort: { issuedAt: 1 }, new: true }
-    );
+    const strike = await strikeRepo.recoverOldestAtomic(user.id, {
+      resolvedBy: 'system:quota-recovery',
+      reason: 'Recovered via double-quota in ' + period.periodKey + '.',
+      periodKey: period.periodKey,
+    });
     if (!strike) break;
     applied++;
   }

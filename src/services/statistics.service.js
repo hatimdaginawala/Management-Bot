@@ -1,32 +1,22 @@
-import {
-  User,
-  Role,
-  RoleAssignment,
-  Event,
-  EventType,
-  Attendance,
-  QuotaResult,
-  Strike,
-  Leave,
-  Notice,
-  RemovalRequest,
-  RankHistory,
-  SyncLog,
-} from '../models/index.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as eventRepo from '../db/repositories/event.repository.js';
+import * as attendanceRepo from '../db/repositories/attendance.repository.js';
+import * as quotaResultRepo from '../db/repositories/quotaResult.repository.js';
+import * as strikeRepo from '../db/repositories/strike.repository.js';
+import * as leaveRepo from '../db/repositories/leave.repository.js';
+import * as noticeRepo from '../db/repositories/notice.repository.js';
+import * as removalRequestRepo from '../db/repositories/removalRequest.repository.js';
+import * as rankHistoryRepo from '../db/repositories/rankHistory.repository.js';
+import * as syncLogRepo from '../db/repositories/syncLog.repository.js';
+import * as roleAssignmentRepo from '../db/repositories/roleAssignment.repository.js';
 import { isoWeekBounds, isoWeekKey } from '../utils/isoWeek.js';
 import { ValidationError, NotFoundError } from '../utils/errors.js';
 
 /**
- * Statistics service.
+ * Statistics service. Public API unchanged.
  *
- * Read-only aggregations. Every function returns plain JS objects.
- * No Mongoose documents are exposed to callers — this keeps the layer
- * stable for a future REST API and avoids `.toJSON()` leaks.
- *
- * Conventions:
- *   - All date ranges are half-open: [from, to)
- *   - All times are UTC
- *   - Top-N lists default to 10 and are capped at 50
+ * All aggregations use the repository layer, which in turn uses SQL
+ * GROUP BY / COUNT / SUM. No full-table scans on large collections.
  */
 
 const DAY_MS = 86_400_000;
@@ -62,34 +52,21 @@ function windowFor(kind, asOf = new Date()) {
     const { startAt, endAt } = monthBounds(asOf);
     return { startAt, endAt, kind };
   }
-  throw new ValidationError(`Unknown window kind: ${kind}`);
+  throw new ValidationError('Unknown window kind: ' + kind);
 }
 
 // ============================================================
-//  Time-window summary — used by daily/weekly/monthly
+//  Window summary
 // ============================================================
 
-/**
- * Return a summary for the given window.
- *
- * Includes:
- *   - total events, grouped by type
- *   - total attendance
- *   - top hosts and top attendees
- *   - new strikes issued, strikes recovered
- *   - quota met / missed
- *   - pending removals created
- *   - active leaves and notices (as of `asOf`)
- *   - Roblox sync summary
- */
 export async function windowSummary(kind, { asOf = new Date(), top = 5 } = {}) {
   const { startAt, endAt, periodKey } = windowFor(kind, asOf);
   top = Math.min(MAX_TOP, Math.max(1, Number(top) || 5));
 
   const [
-    totalEvents,
+    eventsByStatus,
     eventsByType,
-    totalAttendance,
+    attendanceCounts,
     topHosts,
     topAttendees,
     newStrikes,
@@ -101,73 +78,22 @@ export async function windowSummary(kind, { asOf = new Date(), top = 5 } = {}) {
     activeNotices,
     syncSummary,
   ] = await Promise.all([
-    Event.countDocuments({ status: 'APPROVED', createdAt: { $gte: startAt, $lt: endAt } }),
-
-    Event.aggregate([
-      { $match: { status: 'APPROVED', createdAt: { $gte: startAt, $lt: endAt } } },
-      { $group: { _id: '$eventTypeKey', count: { $sum: 1 } } },
-      { $sort: { count: -1, _id: 1 } },
-    ]),
-
-    Attendance.countDocuments({ active: true, eventAt: { $gte: startAt, $lt: endAt } }),
-
-    Event.aggregate([
-      { $match: { status: 'APPROVED', createdAt: { $gte: startAt, $lt: endAt } } },
-      { $group: {
-        _id: '$host.discordId',
-        count: { $sum: 1 },
-        username: { $first: '$host.discordUsername' },
-        robloxUsername: { $first: '$host.robloxUsername' },
-      }},
-      { $sort: { count: -1, _id: 1 } },
-      { $limit: top },
-    ]),
-
-    Attendance.aggregate([
-      { $match: { active: true, eventAt: { $gte: startAt, $lt: endAt } } },
-      { $group: { _id: '$discordId', count: { $sum: 1 } } },
-      { $sort: { count: -1, _id: 1 } },
-      { $limit: top },
-    ]),
-
-    Strike.countDocuments({ issuedAt: { $gte: startAt, $lt: endAt } }),
-    Strike.countDocuments({
-      status: 'RECOVERED',
-      resolvedAt: { $gte: startAt, $lt: endAt },
-    }),
-
-    QuotaResult.countDocuments({ evaluatedAt: { $gte: startAt, $lt: endAt }, status: 'MET' }),
-    QuotaResult.countDocuments({ evaluatedAt: { $gte: startAt, $lt: endAt }, status: 'MISSED' }),
-
-    RemovalRequest.countDocuments({ createdAt: { $gte: startAt, $lt: endAt } }),
-
-    Leave.countDocuments({
-      status: 'APPROVED',
-      startAt: { $lt: endAt },
-      endAt: { $gt: startAt },
-    }),
-
-    Notice.countDocuments({
-      status: 'ACTIVE',
-      startAt: { $lt: endAt },
-      $or: [{ endAt: null }, { endAt: { $gt: startAt } }],
-    }),
-
-    SyncLog.aggregate([
-      { $match: { status: { $in: ['SUCCESS', 'PARTIAL'] }, startedAt: { $gte: startAt, $lt: endAt } } },
-      {
-        $group: {
-          _id: null,
-          syncCount: { $sum: 1 },
-          membersFetched: { $sum: '$membersFetched' },
-          membersCreated: { $sum: '$membersCreated' },
-          membersUpdated: { $sum: '$membersUpdated' },
-          rankChanges: { $sum: '$rankChanges' },
-          membersRemoved: { $sum: '$membersRemoved' },
-        },
-      },
-    ]),
+    eventRepo.countByStatusInRange({ from: startAt, to: endAt }),
+    eventRepo.countByTypeInRange({ from: startAt, to: endAt }),
+    attendanceRepo.distinctCountsInRange({ from: startAt, to: endAt }),
+    eventRepo.topHostsInRange({ from: startAt, to: endAt, limit: top }),
+    attendanceRepo.topAttendeesInRange({ from: startAt, to: endAt, limit: top }),
+    strikeRepo.countIssuedInWindow({ from: startAt, to: endAt }),
+    strikeRepo.countRecoveredInWindow({ from: startAt, to: endAt }),
+    quotaResultRepo.countByStatusInWindow({ from: startAt, to: endAt, status: 'MET' }),
+    quotaResultRepo.countByStatusInWindow({ from: startAt, to: endAt, status: 'MISSED' }),
+    removalRequestRepo.countCreatedInWindow({ from: startAt, to: endAt }),
+    leaveRepo.findOverlappingApprovedInPeriod({ start_at: startAt, end_at: endAt }).then((ids) => ids.length),
+    noticeRepo.countActiveInRange({ from: startAt, to: endAt }),
+    syncLogRepo.aggregateInWindow({ from: startAt, to: endAt }),
   ]);
+
+  const totalEvents = eventsByStatus.APPROVED || 0;
 
   return {
     kind,
@@ -177,7 +103,7 @@ export async function windowSummary(kind, { asOf = new Date(), top = 5 } = {}) {
     periodKey: periodKey ?? null,
     summary: {
       totalEvents,
-      totalAttendance,
+      totalAttendance: attendanceCounts.total,
       newStrikes,
       recoveredStrikes,
       pendingRemovals,
@@ -186,27 +112,10 @@ export async function windowSummary(kind, { asOf = new Date(), top = 5 } = {}) {
       quotaMet,
       quotaMissed,
     },
-    eventsByType: eventsByType.map((r) => ({ typeKey: r._id, count: r.count })),
-    topHosts: topHosts.map((r) => ({
-      discordId: r._id,
-      discordUsername: r.username ?? null,
-      robloxUsername: r.robloxUsername ?? null,
-      count: r.count,
-    })),
-    topAttendees: topAttendees.map((r) => ({
-      discordId: r._id,
-      count: r.count,
-    })),
-    sync: syncSummary[0]
-      ? {
-          syncCount: syncSummary[0].syncCount,
-          membersFetched: syncSummary[0].membersFetched,
-          membersCreated: syncSummary[0].membersCreated,
-          membersUpdated: syncSummary[0].membersUpdated,
-          rankChanges: syncSummary[0].rankChanges,
-          membersRemoved: syncSummary[0].membersRemoved,
-        }
-      : { syncCount: 0, membersFetched: 0, membersCreated: 0, membersUpdated: 0, rankChanges: 0, membersRemoved: 0 },
+    eventsByType,
+    topHosts,
+    topAttendees,
+    sync: syncSummary,
   };
 }
 
@@ -226,11 +135,8 @@ export async function monthlyStats(opts = {}) {
 //  Per-user dashboard
 // ============================================================
 
-/**
- * Everything known about one user for /stats user.
- */
 export async function userStats(discordId) {
-  const user = await User.findOne({ discordId }).lean();
+  const user = await userRepo.findByDiscordId(discordId);
   if (!user) throw new NotFoundError('User', { discordId });
 
   const [
@@ -240,53 +146,56 @@ export async function userStats(discordId) {
     activeStrikes,
     lifetimeStrikes,
     recoveredStrikes,
-    rankChanges,
+    rankChangeCount,
     activeLeave,
     activeNotices,
-    quotaHistory,
+    recentQuotaResults,
   ] = await Promise.all([
-    RoleAssignment.find({ user: user._id, active: true }).populate('role').lean(),
-    Event.countDocuments({ 'host.discordId': discordId, status: 'APPROVED' }),
-    Attendance.countDocuments({ user: user._id, active: true }),
-    Strike.countDocuments({ user: user._id, status: 'ACTIVE' }),
-    Strike.countDocuments({ user: user._id }),
-    Strike.countDocuments({ user: user._id, status: 'RECOVERED' }),
-    RankHistory.countDocuments({ user: user._id }),
-    Leave.findOne({
-      user: user._id,
-      status: 'APPROVED',
-      startAt: { $lte: new Date() },
-      endAt: { $gte: new Date() },
-    }).lean(),
-    Notice.find({ user: user._id, status: 'ACTIVE' }).lean(),
-    QuotaResult.find({ user: user._id })
-      .sort({ evaluatedAt: -1 })
-      .limit(8)
-      .lean(),
+    roleAssignmentRepo.findActiveForUser(user.id),
+    eventRepo.countApprovedByHostInRange(discordId, {
+      from: new Date(0),
+      to: new Date(Date.now() + 100 * 365 * DAY_MS),
+    }),
+    attendanceRepo.countActiveForUserInRange(user.id, {
+      from: new Date(0),
+      to: new Date(Date.now() + 100 * 365 * DAY_MS),
+    }),
+    strikeRepo.countActiveForUser(discordId),
+    strikeRepo.historyForUser(discordId, { limit: 200 }).then((rows) => rows.length),
+    strikeRepo.historyForUser(discordId, { limit: 200 }).then(
+      (rows) => rows.filter((s) => s.status === 'RECOVERED').length
+    ),
+    rankHistoryRepo.countForUser(user.id),
+    leaveRepo.findActiveForDiscordId(discordId),
+    noticeRepo.listActiveForDiscordId(discordId),
+    quotaResultRepo.recentForUser(user.id, { limit: 8 }),
   ]);
 
   const roles = assignments
-    .map((a) => a.role)
-    .filter(Boolean)
-    .map((r) => ({ key: r.key, name: r.name, priority: r.priority }))
+    .filter((a) => a.role_db_key)
+    .map((a) => ({
+      key: a.role_db_key,
+      name: a.role_db_name,
+      priority: a.role_db_priority,
+    }))
     .sort((a, b) => b.priority - a.priority);
 
   return {
     user: {
-      discordId: user.discordId,
-      discordUsername: user.discordUsername ?? null,
-      robloxId: user.robloxId ?? null,
-      robloxUsername: user.robloxUsername ?? null,
+      discordId: user.discord_id,
+      discordUsername: user.discord_username,
+      robloxId: user.roblox_id,
+      robloxUsername: user.roblox_username,
       status: user.status,
-      quotaCategory: user.quota?.category ?? 'NONE',
-      quotaExempt: Boolean(user.quota?.exempt),
-      joinedAt: user.joinedAt,
+      quotaCategory: user.quota_category,
+      quotaExempt: user.quota_exempt,
+      joinedAt: user.joined_at,
     },
     roles,
     activity: {
       totalEventsHosted,
       totalEventsAttended,
-      rankChanges,
+      rankChanges: rankChangeCount,
     },
     strikes: {
       active: activeStrikes,
@@ -295,11 +204,11 @@ export async function userStats(discordId) {
     },
     activeLeave,
     activeNotices,
-    recentQuotaResults: quotaHistory.map((q) => ({
-      periodKey: q.periodKey,
+    recentQuotaResults: recentQuotaResults.map((q) => ({
+      periodKey: q.period_key,
       category: q.category,
-      required: q.required,
-      actual: q.actual,
+      required: q.required_amount,
+      actual: q.actual_amount,
       status: q.status,
     })),
   };
@@ -309,289 +218,132 @@ export async function userStats(discordId) {
 //  Domain statistics
 // ============================================================
 
-/**
- * Aggregate events over an optional time window.
- * Grouped by: total, status, type.
- */
 export async function eventStats({ from = null, to = null } = {}) {
-  const match = {};
-  if (from || to) {
-    match.createdAt = {};
-    if (from) match.createdAt.$gte = new Date(from);
-    if (to) match.createdAt.$lt = new Date(to);
-  }
+  const fromDate = from ?? new Date(0);
+  const toDate = to ?? new Date(Date.now() + 100 * 365 * DAY_MS);
 
-  const [byStatus, byType, total] = await Promise.all([
-    Event.aggregate([
-      { $match: match },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]),
-    Event.aggregate([
-      { $match: match },
-      { $group: { _id: '$eventTypeKey', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
-    Event.countDocuments(match),
+  const [byStatus, byType] = await Promise.all([
+    eventRepo.countByStatusInRange({ from: fromDate, to: toDate }),
+    eventRepo.countByTypeInRange({ from: fromDate, to: toDate }),
   ]);
+
+  const total = Object.values(byStatus).reduce((s, n) => s + n, 0);
 
   return {
     total,
-    byStatus: Object.fromEntries(byStatus.map((r) => [r._id, r.count])),
-    byType: byType.map((r) => ({ typeKey: r._id, count: r.count })),
+    byStatus,
+    byType,
   };
 }
 
 /**
- * Attendance statistics over an optional time window.
- * Returns total, unique attendees, and avg attendance per event.
+ * Counts events in a window grouped by type + status.
+ * Used by /event stats.
  */
-export async function attendanceStats({ from = null, to = null } = {}) {
-  const match = { active: true };
-  if (from || to) {
-    match.eventAt = {};
-    if (from) match.eventAt.$gte = new Date(from);
-    if (to) match.eventAt.$lt = new Date(to);
-  }
-
-  const result = await Attendance.aggregate([
-    { $match: match },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: 1 },
-        uniqueUsers: { $addToSet: '$user' },
-        uniqueEvents: { $addToSet: '$event' },
-      },
-    },
-    {
-      $project: {
-        _id: 0,
-        total: 1,
-        uniqueAttendees: { $size: '$uniqueUsers' },
-        uniqueEvents: { $size: '$uniqueEvents' },
-      },
-    },
+export async function eventCountsInWindow({ from, to }) {
+  const [byStatus, byType] = await Promise.all([
+    eventRepo.countByStatusInRange({ from, to }),
+    eventRepo.countByTypeInRange({ from, to }),
   ]);
+  const total = Object.values(byStatus).reduce((s, n) => s + n, 0);
+  return { total, byStatus, byType };
+}
 
-  const base = result[0] ?? { total: 0, uniqueAttendees: 0, uniqueEvents: 0 };
-  const avgPerEvent = base.uniqueEvents > 0
-    ? Math.round((base.total / base.uniqueEvents) * 100) / 100
+export async function attendanceStats({ from = null, to = null } = {}) {
+  const counts = await attendanceRepo.distinctCountsInRange({ from, to });
+
+  const avgPerEvent = counts.uniqueEvents > 0
+    ? Math.round((counts.total / counts.uniqueEvents) * 100) / 100
     : 0;
 
   return {
-    totalAttendance: base.total,
-    uniqueAttendees: base.uniqueAttendees,
-    uniqueEvents: base.uniqueEvents,
+    totalAttendance: counts.total,
+    uniqueAttendees: counts.uniqueAttendees,
+    uniqueEvents: counts.uniqueEvents,
     avgPerEvent,
   };
 }
 
-/**
- * Top hosts across an optional window. Returns up to `top` entries.
- */
 export async function hostStats({ from = null, to = null, top = 10 } = {}) {
   top = Math.min(MAX_TOP, Math.max(1, Number(top) || 10));
 
-  const match = { status: 'APPROVED' };
-  if (from || to) {
-    match.createdAt = {};
-    if (from) match.createdAt.$gte = new Date(from);
-    if (to) match.createdAt.$lt = new Date(to);
-  }
+  const fromDate = from ?? new Date(0);
+  const toDate = to ?? new Date(Date.now() + 100 * 365 * DAY_MS);
 
-  const rows = await Event.aggregate([
-    { $match: match },
-    { $group: {
-      _id: '$host.discordId',
-      count: { $sum: 1 },
-      discordUsername: { $first: '$host.discordUsername' },
-      robloxUsername: { $first: '$host.robloxUsername' },
-    }},
-    { $sort: { count: -1, _id: 1 } },
-    { $limit: top },
-  ]);
+  const rows = await eventRepo.topHostsInRange({ from: fromDate, to: toDate, limit: top });
 
   return rows.map((r) => ({
-    discordId: r._id,
-    discordUsername: r.discordUsername ?? null,
-    robloxUsername: r.robloxUsername ?? null,
+    discordId: r.discordId,
+    discordUsername: r.discordUsername,
+    robloxUsername: r.robloxUsername,
     count: r.count,
   }));
 }
 
-/**
- * Quota statistics: aggregated per-category over a window.
- */
 export async function quotaStats({ from = null, to = null } = {}) {
-  const match = {};
-  if (from || to) {
-    match.evaluatedAt = {};
-    if (from) match.evaluatedAt.$gte = new Date(from);
-    if (to) match.evaluatedAt.$lt = new Date(to);
-  }
-
-  const rows = await QuotaResult.aggregate([
-    { $match: match },
-    {
-      $group: {
-        _id: { category: '$category', status: '$status' },
-        count: { $sum: 1 },
-      },
-    },
-  ]);
-
-  const out = {
-    STAFF: { MET: 0, MISSED: 0, EXEMPT: 0 },
-    LOW_RANK: { MET: 0, MISSED: 0, EXEMPT: 0 },
-  };
-  for (const r of rows) {
-    const cat = r._id.category;
-    const st = r._id.status;
-    if (out[cat] && out[cat][st] !== undefined) {
-      out[cat][st] = r.count;
-    }
-  }
-  return out;
+  return quotaResultRepo.aggregateByCategoryAndStatus({ from, to });
 }
 
-/**
- * Strike statistics: total, active, recovered, cancelled, and per-period.
- */
 export async function strikeStats({ from = null, to = null, top = 10 } = {}) {
   top = Math.min(MAX_TOP, Math.max(1, Number(top) || 10));
 
-  const match = {};
-  if (from || to) {
-    match.issuedAt = {};
-    if (from) match.issuedAt.$gte = new Date(from);
-    if (to) match.issuedAt.$lt = new Date(to);
-  }
-
-  const [byStatus, topUsers, total] = await Promise.all([
-    Strike.aggregate([
-      { $match: match },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]),
-    Strike.aggregate([
-      { $match: { ...match, status: 'ACTIVE' } },
-      { $group: { _id: '$discordId', count: { $sum: 1 } } },
-      { $sort: { count: -1, _id: 1 } },
-      { $limit: top },
-    ]),
-    Strike.countDocuments(match),
+  const [byStatus, topUsers] = await Promise.all([
+    strikeRepo.aggregateByStatusInWindow({ from, to }),
+    strikeRepo.topUsersWithActiveStrikes({ limit: top }),
   ]);
+
+  const total = Object.values(byStatus).reduce((s, n) => s + n, 0);
 
   return {
     total,
-    byStatus: Object.fromEntries(byStatus.map((r) => [r._id, r.count])),
-    topUsersWithActiveStrikes: topUsers.map((r) => ({
-      discordId: r._id,
-      count: r.count,
-    })),
+    byStatus,
+    topUsersWithActiveStrikes: topUsers,
   };
 }
 
-/**
- * Roblox sync summary across recent SyncLogs.
- */
 export async function syncStats({ limit = 10 } = {}) {
   limit = Math.min(50, Math.max(1, Number(limit) || 10));
 
-  const [last, aggregate] = await Promise.all([
-    SyncLog.find({ type: 'ROBLOX_GROUP_SYNC' })
-      .sort({ startedAt: -1 })
-      .limit(limit)
-      .lean(),
-    SyncLog.aggregate([
-      { $match: { type: 'ROBLOX_GROUP_SYNC', status: { $in: ['SUCCESS', 'PARTIAL'] } } },
-      {
-        $group: {
-          _id: null,
-          syncCount: { $sum: 1 },
-          membersFetched: { $sum: '$membersFetched' },
-          membersCreated: { $sum: '$membersCreated' },
-          membersUpdated: { $sum: '$membersUpdated' },
-          rankChanges: { $sum: '$rankChanges' },
-          membersRemoved: { $sum: '$membersRemoved' },
-        },
-      },
-    ]),
+  const [recent, totals] = await Promise.all([
+    syncLogRepo.listRecent({ limit }),
+    syncLogRepo.aggregateInWindow({}),
   ]);
 
   return {
-    lastSyncs: last.map((s) => ({
-      startedAt: s.startedAt,
-      completedAt: s.completedAt,
+    lastSyncs: recent.map((s) => ({
+      startedAt: s.started_at,
+      completedAt: s.completed_at,
       status: s.status,
-      membersFetched: s.membersFetched,
-      rankChanges: s.rankChanges,
-      membersRemoved: s.membersRemoved,
+      membersFetched: s.members_fetched,
+      rankChanges: s.rank_changes,
+      membersRemoved: s.members_removed,
     })),
-    totals: aggregate[0] ?? {
-      syncCount: 0,
-      membersFetched: 0,
-      membersCreated: 0,
-      membersUpdated: 0,
-      rankChanges: 0,
-      membersRemoved: 0,
-    },
+    totals,
   };
 }
 
-/**
- * Member counts grouped by Roblox rank and by internal role.
- */
 export async function memberBreakdown() {
-  const [byStatus, byQuotaCategory, byRank, byRole] = await Promise.all([
-    User.aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]),
-    User.aggregate([
-      { $group: { _id: '$quota.category', count: { $sum: 1 } } },
-    ]),
-    User.aggregate([
-      { $match: { 'roblox.rankName': { $ne: null } } },
-      { $group: { _id: '$roblox.rankName', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
-    RoleAssignment.aggregate([
-      { $match: { active: true } },
-      { $group: { _id: '$roleKey', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
+  // Implemented via repository count queries.
+  // We don't have a single aggregate that returns everything, so we
+  // batch a few queries.
+  const [byStatusList, byCategoryList] = await Promise.all([
+    userRepo.countByStatus(),
+    userRepo.countByQuotaCategory(),
   ]);
 
-  return {
-    byStatus: Object.fromEntries(byStatus.map((r) => [r._id, r.count])),
-    byQuotaCategory: Object.fromEntries(byQuotaCategory.map((r) => [r._id, r.count])),
-    byRobloxRank: byRank.map((r) => ({ rankName: r._id, count: r.count })),
-    byRole: byRole.map((r) => ({ roleKey: r._id, count: r.count })),
-  };
-}
+  const byStatus = Object.fromEntries(byStatusList.map((r) => [r.status, r.count]));
+  const byQuotaCategory = Object.fromEntries(byCategoryList.map((r) => [r.category, r.count]));
 
-/**
- * Count events in a window grouped by type and status.
- * Used by /event stats.
- */
-export async function eventCountsInWindow({ from, to }) {
-  const match = { createdAt: { $gte: from, $lte: to } };
+  // Role breakdown
+  const byRoleList = await roleAssignmentRepo.countActiveByRoleKey();
 
-  const [total, byStatus, byType] = await Promise.all([
-    Event.countDocuments(match),
-    Event.aggregate([
-      { $match: match },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]),
-    Event.aggregate([
-      { $match: match },
-      { $group: { _id: '$eventTypeKey', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]),
-  ]);
+  // Rank breakdown — light aggregate
+  const byRankList = await userRepo.countByRobloxRankName({ limit: 20 });
 
   return {
-    total,
-    byStatus: Object.fromEntries(byStatus.map((r) => [r._id, r.count])),
-    byType: byType.map((r) => ({ typeKey: r._id, count: r.count })),
+    byStatus,
+    byQuotaCategory,
+    byRobloxRank: byRankList.map((r) => ({ rankName: r.rankName, count: r.count })),
+    byRole: byRoleList.map((r) => ({ roleKey: r.roleKey, count: r.count })),
   };
 }

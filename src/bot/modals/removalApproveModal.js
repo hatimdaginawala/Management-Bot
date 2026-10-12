@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as removalRequestService from '../../services/removalRequest.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import { successEmbed, errorEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
@@ -11,9 +11,9 @@ export const customId = 'modal:removal-approve';
 export const meta = {};
 
 export async function execute(interaction) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'removal.approve');
+  const ok = await permissionService.hasPermission(user.id, 'removal.approve');
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 
   const session = sessions.getSession('removal:approve', interaction.user.id);
@@ -46,16 +46,16 @@ export async function execute(interaction) {
 
   await dmRemovalApproved(interaction.client, request, {
     actorId: interaction.user.id,
-    effectiveAt: request.removalEffectiveAt,
+    effectiveAt: request.removal_effective_at,
     reason: reason || null,
   });
 
   return interaction.editReply({
     embeds: [successEmbed({
       title: 'Removal Approved',
-      description: 'Removal request for <@' + request.discordId + '> has been approved.',
+      description: 'Removal request for <@' + request.discord_id + '> has been approved.',
       fields: [
-        { name: 'Effective', value: '<t:' + Math.floor(new Date(request.removalEffectiveAt).getTime() / 1000) + ':f>', inline: true },
+        { name: 'Effective', value: '<t:' + Math.floor(new Date(request.removal_effective_at).getTime() / 1000) + ':f>', inline: true },
         ...(reason ? [{ name: 'Reason', value: reason, inline: false }] : []),
       ],
     })],

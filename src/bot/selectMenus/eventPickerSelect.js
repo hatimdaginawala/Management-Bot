@@ -1,9 +1,9 @@
 import { MessageFlags } from 'discord.js';
 import * as eventService from '../../services/event.service.js';
 import * as permissionService from '../../services/permission.service.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { successEmbed, errorEmbed, infoEmbed } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
 import { formatEventSummary } from '../components/eventPicker.js';
 
 export const customId = 'event-picker:*';
@@ -15,18 +15,14 @@ export async function execute(interaction) {
 
   const eventId = interaction.values[0];
 
-  // Dispatch based on action.
   switch (action) {
     case 'view':    return handleView(interaction, eventId);
     case 'approve': return handleApprove(interaction, eventId);
     case 'reject':  return handleReject(interaction, eventId);
     case 'cancel':  return handleCancel(interaction, eventId);
-    default:
-      return ephemeralError(interaction, 'Unknown action: ' + action);
+    default:        return ephemeralError(interaction, 'Unknown action: ' + action);
   }
 }
-
-// ---------- view ----------
 
 async function handleView(interaction, eventId) {
   await requirePermission(interaction, 'events.view');
@@ -37,15 +33,13 @@ async function handleView(interaction, eventId) {
       title: 'Event Details',
       description: formatEventSummary(event),
       fields: [
-        { name: 'Proof', value: event.proofUrl, inline: false },
+        { name: 'Proof', value: event.proof_url, inline: false },
         ...(event.notes ? [{ name: 'Notes', value: event.notes, inline: false }] : []),
       ],
     })],
     components: [],
   });
 }
-
-// ---------- approve ----------
 
 async function handleApprove(interaction, eventId) {
   await requirePermission(interaction, 'events.approve');
@@ -60,14 +54,10 @@ async function handleApprove(interaction, eventId) {
   });
 }
 
-// ---------- reject ----------
-
 async function handleReject(interaction, eventId) {
   await requirePermission(interaction, 'events.reject');
 
-  // Open the reason modal.
-  const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } =
-    await import('discord.js');
+  const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = await import('discord.js');
 
   const modal = new ModalBuilder()
     .setCustomId('modal:event-reject:' + eventId)
@@ -87,13 +77,10 @@ async function handleReject(interaction, eventId) {
   return interaction.showModal(modal);
 }
 
-// ---------- cancel ----------
-
 async function handleCancel(interaction, eventId) {
   await requirePermission(interaction, 'events.cancel');
 
-  const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } =
-    await import('discord.js');
+  const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = await import('discord.js');
 
   const modal = new ModalBuilder()
     .setCustomId('modal:event-cancel:' + eventId)
@@ -111,17 +98,15 @@ async function handleCancel(interaction, eventId) {
   return interaction.showModal(modal);
 }
 
-// ---------- helpers ----------
-
 function extractAction(customId) {
   const m = /^event-picker:(\w+)$/.exec(customId);
   return m ? m[1] : null;
 }
 
 async function requirePermission(interaction, key) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, key);
+  const ok = await permissionService.hasPermission(user.id, key);
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }
 

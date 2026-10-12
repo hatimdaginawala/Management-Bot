@@ -14,7 +14,6 @@ export const meta = {
 export async function execute(interaction) {
   const { user, pending } = await verificationService.getLinkStatus(interaction.user.id);
 
-  // Case 1: no User doc at all → user hasn't interacted with the bot yet.
   if (!user) {
     const embed = warningEmbed({
       title: 'Not Linked',
@@ -25,10 +24,9 @@ export async function execute(interaction) {
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
-  // Case 2: User exists but no Roblox identity.
-  if (!user.robloxId) {
+  if (!user.roblox_id) {
     if (pending) {
-      const expiresAt = new Date(pending.expiresAt);
+      const expiresAt = new Date(pending.expires_at);
       const unix = Math.floor(expiresAt.getTime() / 1000);
       const embed = infoEmbed({
         title: 'Verification Pending',
@@ -36,8 +34,8 @@ export async function execute(interaction) {
           'You have a pending verification. Paste the code in your Roblox ' +
           'About section and run `/verify`.',
         fields: [
-          { name: 'Roblox Username', value: `\`${pending.robloxUsername}\``, inline: true },
-          { name: 'Expires', value: `<t:${unix}:R>`, inline: true },
+          { name: 'Roblox Username', value: '`' + pending.roblox_username + '`', inline: true },
+          { name: 'Expires', value: '<t:' + unix + ':R>', inline: true },
         ],
       });
       return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -53,14 +51,13 @@ export async function execute(interaction) {
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
-  // Case 3: fully linked.
   const embed = successEmbed({
     title: 'Account Linked',
     description: 'Your Discord account is linked to a Roblox account.',
     fields: [
-      { name: 'Roblox Username', value: `\`${user.robloxUsername ?? '—'}\``, inline: true },
-      { name: 'Roblox ID', value: `\`${user.robloxId}\``, inline: true },
-      { name: 'Status', value: `\`${user.status}\``, inline: true },
+      { name: 'Roblox Username', value: '`' + (user.roblox_username ?? '—') + '`', inline: true },
+      { name: 'Roblox ID', value: '`' + user.roblox_id + '`', inline: true },
+      { name: 'Status', value: '`' + user.status + '`', inline: true },
     ],
   });
   return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });

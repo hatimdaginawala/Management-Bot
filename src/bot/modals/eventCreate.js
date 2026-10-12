@@ -20,10 +20,7 @@ export async function execute(interaction) {
 
   if (attendees.length === 0) {
     return interaction.reply({
-      embeds: [errorEmbed({
-        title: 'No Attendees',
-        description: 'You must provide at least one attendee.',
-      })],
+      embeds: [errorEmbed({ title: 'No Attendees', description: 'You must provide at least one attendee.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -43,11 +40,11 @@ export async function execute(interaction) {
         title: 'Event Logged',
         description: 'Your event was recorded and approved automatically.',
         fields: [
-          { name: 'Type', value: '`' + event.eventTypeKey + '`', inline: true },
-          { name: 'Hosted By', value: '<@' + event.host.discordId + '>', inline: true },
+          { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
+          { name: 'Hosted By', value: '<@' + event.host_discord_id + '>', inline: true },
           { name: 'Attendees Credited', value: String(event.attendeeEntries.length), inline: true },
-          { name: 'Logged', value: '<t:' + Math.floor(new Date(event.createdAt).getTime() / 1000) + ':R>', inline: true },
-          { name: 'Proof', value: '<' + event.proofUrl + '>', inline: false },
+          { name: 'Logged', value: '<t:' + Math.floor(new Date(event.created_at).getTime() / 1000) + ':R>', inline: true },
+          { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
         ],
       })],
     });
@@ -70,37 +67,27 @@ export async function execute(interaction) {
 
   try {
     const channel = await interaction.client.channels.fetch(approvalChannelId);
-    if (!channel?.isTextBased?.()) {
-      throw new Error('Approval channel not text-based');
-    }
+    if (!channel?.isTextBased?.()) throw new Error('Approval channel not text-based');
 
-    const ts = Math.floor(new Date(event.createdAt).getTime() / 1000);
+    const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
     const reviewEmbed = new EmbedBuilder()
       .setColor(COLORS.INFO)
       .setTitle('Event Pending Approval')
-      .setDescription('<' + '@' + event.host.discordId + '> submitted an event on <t:' + ts + ':f>.')
+      .setDescription('<' + '@' + event.host_discord_id + '> submitted an event on <t:' + ts + ':f>.')
       .addFields(
-        { name: 'Type', value: '`' + event.eventTypeKey + '`', inline: true },
+        { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
         { name: 'Attendees', value: String(event.attendeeEntries.length), inline: true },
         { name: 'Logged', value: '<t:' + ts + ':R>', inline: true },
-        { name: 'Proof', value: '<' + event.proofUrl + '>', inline: false },
+        { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
       )
       .setTimestamp(new Date());
 
     if (event.notes) reviewEmbed.addFields({ name: 'Notes', value: event.notes, inline: false });
+
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('event:approve:' + event._id)
-        .setLabel('Approve')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId('event:reject:' + event._id)
-        .setLabel('Reject')
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId('event:details:' + event._id)
-        .setLabel('Details')
-        .setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('event:approve:' + event.id).setLabel('Approve').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('event:reject:' + event.id).setLabel('Reject').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('event:details:' + event.id).setLabel('Details').setStyle(ButtonStyle.Secondary)
     );
 
     await channel.send({ embeds: [reviewEmbed], components: [row] });
@@ -110,17 +97,14 @@ export async function execute(interaction) {
         title: 'Event Submitted',
         description: 'Your event has been submitted for review. You will be notified once a decision is made.',
         fields: [
-          { name: 'Type', value: '`' + event.eventTypeKey + '`', inline: true },
+          { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
           { name: 'Logged', value: '<t:' + ts + ':R>', inline: true },
           { name: 'Approval Channel', value: '<#' + approvalChannelId + '>', inline: false },
         ],
       })],
     });
   } catch (err) {
-    logger.error(
-      { err: err.message, channelId: approvalChannelId },
-      'Failed to post event approval message'
-    );
+    logger.error({ err: err.message, channelId: approvalChannelId }, 'Failed to post event approval message');
     return interaction.editReply({
       embeds: [infoEmbed({
         title: 'Event Submitted (Pending Review)',
@@ -142,26 +126,16 @@ function parseAttendees(raw) {
     const mention = /^<@!?(\d{15,25})>$/.exec(part);
     if (mention) {
       const id = mention[1];
-      if (!seen.has(id)) {
-        seen.add(id);
-        out.push({ discordId: id });
-      }
+      if (!seen.has(id)) { seen.add(id); out.push({ discordId: id }); }
       continue;
     }
     if (/^\d{15,25}$/.test(part)) {
-      if (!seen.has(part)) {
-        seen.add(part);
-        out.push({ discordId: part });
-      }
+      if (!seen.has(part)) { seen.add(part); out.push({ discordId: part }); }
       continue;
     }
     if (/^[A-Za-z0-9_]{3,20}$/.test(part)) {
       const key = 'rbx:' + part.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        out.push({ robloxUsername: part });
-      }
-      continue;
+      if (!seen.has(key)) { seen.add(key); out.push({ robloxUsername: part }); }
     }
   }
   return out;

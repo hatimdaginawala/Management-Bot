@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
-import { Verification, User } from '../models/index.js';
-import { Settings } from '../models/index.js';
+import * as verificationRepo from '../db/repositories/verification.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as settingsRepo from '../db/repositories/settings.repository.js';
+import * as robloxUserService from './robloxUser.service.js';
 import { audit } from '../utils/audit.js';
 import {
   ConflictError,
@@ -9,28 +11,16 @@ import {
   RateLimitError,
   ExternalAPIError,
 } from '../utils/errors.js';
-import * as robloxUserService from './robloxUser.service.js';
 import logger from '../config/logger.js';
 
 const CODE_LENGTH = 12;
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O/0, I/1
-const DEFAULT_TTL_MINUTES = 30;
-const DEFAULT_MAX_ATTEMPTS = 5;
-const DEFAULT_RELINK_COOLDOWN_DAYS = 7;
-
-/**
- * Verification service.
- *
- * Owns the /link → /verify lifecycle. Nothing else writes to the
- * Verification collection.
- */
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 // ============================================================
 //  Code generation
 // ============================================================
 
 function generateCode() {
-  // crypto.randomInt is CSPRNG-backed and unbiased for our alphabet size.
   let code = '';
   for (let i = 0; i < CODE_LENGTH; i++) {
     code += CODE_ALPHABET[crypto.randomInt(0, CODE_ALPHABET.length)];
@@ -39,26 +29,44 @@ function generateCode() {
 }
 
 // ============================================================
-//  Settings helpers
+//  Settings helpers — read from the settings repository
 // ============================================================
 
+const SETTING_DEFAULTS = {
+  ttlMinutes: 30,
+  maxAttempts: 5,
+  relinkCooldownDays: 7,
+};
+
 async function getVerificationSettings() {
-  const s = await Settings.findOne({ key: 'global' }).lean();
-  return {
-    ttlMinutes: s?.verification?.codeTtlMinutes ?? DEFAULT_TTL_MINUTES,
-    maxAttempts: s?.verification?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
-    relinkCooldownDays:
-      s?.verification?.relinkCooldownDays ?? DEFAULT_RELINK_COOLDOWN_DAYS,
-  };
+  const keys = [
+    ['verification.codeTtlMinutes', 'ttlMinutes'],
+    ['verification.maxAttempts', 'maxAttempts'],
+    ['verification.relinkCooldownDays', 'relinkCooldownDays'],
+  ];
+  const out = { ...SETTING_DEFAULTS };
+  for (const [settingKey, outKey] of keys) {
+    const row = await settingsRepo.findByKey(settingKey);
+    if (row) {
+      const parsed = safeParse(row.value_json);
+      if (typeof parsed === 'number') out[outKey] = parsed;
+    }
+  }
+  return out;
+}
+
+function safeParse(json) {
+  try {
+    return typeof json === 'string' ? JSON.parse(json) : json;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================
-//  Validation helpers
+//  Validation
 // ============================================================
 
-/**
- * Roblox usernames: 3–20 chars, letters/digits/underscore.
- */
 function validateRobloxUsername(username) {
   if (typeof username !== 'string') {
     throw new ValidationError('Roblox username must be a string.');
@@ -73,44 +81,40 @@ function validateRobloxUsername(username) {
 }
 
 // ============================================================
-//  /link — begin the flow
+//  /link — start the flow
 // ============================================================
 
-/**
- * Begin verification: create a PENDING Verification with a fresh code.
- * Returns { verification, robloxUser } so the caller can build the reply.
- */
 export async function startVerification(discordId, robloxUsernameRaw) {
   const robloxUsername = validateRobloxUsername(robloxUsernameRaw);
 
-  // 1. Ensure we have a User row for this Discord.
-  const user = await User.findOne({ discordId });
+  const user = await userRepo.findByDiscordId(discordId);
   if (!user) {
     throw new NotFoundError(
       'User',
       { discordId, hint: 'User must interact with the bot once before linking.' }
     );
   }
-  if (user.robloxId) {
+  if (user.roblox_id) {
     throw new ConflictError(
       'Your Discord account is already linked to a Roblox account. Use /unlink first.'
     );
   }
 
-  // 2. Enforce re-link cooldown (D12).
+  // Cooldown (D12)
   const { relinkCooldownDays } = await getVerificationSettings();
-  if (user.lastUnlinkedAt) {
+  if (user.last_unlinked_at) {
     const cooldownEnds = new Date(
-      user.lastUnlinkedAt.getTime() + relinkCooldownDays * 24 * 60 * 60 * 1000
+      new Date(user.last_unlinked_at).getTime() +
+        relinkCooldownDays * 24 * 60 * 60 * 1000
     );
     if (cooldownEnds > new Date()) {
       throw new RateLimitError(
-        `You unlinked recently. You can re-link after ${cooldownEnds.toISOString()}.`
+        'You unlinked recently. You can re-link after ' + cooldownEnds.toISOString() + '.'
       );
     }
   }
 
-  // 3. Look up the Roblox user via public API.
+  // Roblox account lookup
   const robloxUser = await robloxUserService.findUserByUsername(robloxUsername);
   if (!robloxUser) {
     throw new NotFoundError('Roblox user', { username: robloxUsername });
@@ -119,33 +123,26 @@ export async function startVerification(discordId, robloxUsernameRaw) {
     throw new ValidationError('That Roblox account is banned.');
   }
 
-  // 4. Is this Roblox account already linked to another Discord?
-  const existingLink = await User.findOne({ robloxId: String(robloxUser.id) });
-  if (existingLink && existingLink.discordId !== discordId) {
+  // Already linked to another Discord?
+  const existingLink = await userRepo.findByRobloxId(String(robloxUser.id));
+  if (existingLink && existingLink.discord_id !== discordId) {
     throw new ConflictError(
       'That Roblox account is already linked to another Discord account.'
     );
   }
 
-  // 5. Cancel any existing PENDING verification for this Discord user.
-  //    This is safe because the partial unique index `uniq_pending_per_user`
-  //    allows only one PENDING per user. Cancelling first avoids E11000.
-  await Verification.updateMany(
-    { discordId, status: 'PENDING' },
-    { $set: { status: 'CANCELLED', failureReason: 'Superseded by a newer /link' } }
-  );
+  // Cancel any prior PENDING verification for this user
+  await verificationRepo.cancelPendingFor(discordId, 'Superseded by a newer /link');
 
-  // 6. Compute expiry.
   const { ttlMinutes } = await getVerificationSettings();
   const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
 
-  // 7. Insert. Very small chance of code collision with an existing
-  //    PENDING/VERIFIED doc — the unique index on `code` catches it.
-  let verification;
+  // Try up to 5 times to allocate a unique code
+  let verification = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateCode();
     try {
-      verification = await Verification.create({
+      verification = await verificationRepo.create({
         discordId,
         robloxUsername: robloxUser.name,
         robloxId: String(robloxUser.id),
@@ -156,7 +153,7 @@ export async function startVerification(discordId, robloxUsernameRaw) {
       });
       break;
     } catch (err) {
-      if (err.code === 11000) continue; // code collision, try again
+      if (err instanceof ConflictError) continue;
       throw err;
     }
   }
@@ -169,7 +166,7 @@ export async function startVerification(discordId, robloxUsernameRaw) {
     action: 'verification.started',
     category: 'USER',
     targetType: 'User',
-    targetId: user._id,
+    targetId: user.id,
     after: { robloxUsername: robloxUser.name, expiresAt },
   });
 
@@ -185,15 +182,8 @@ export async function startVerification(discordId, robloxUsernameRaw) {
 //  /verify — complete the flow
 // ============================================================
 
-/**
- * Complete verification by checking the user's Roblox About field
- * for the code. Returns { user, robloxUser } on success.
- */
 export async function completeVerification(discordId) {
-  const verification = await Verification.findOne({
-    discordId,
-    status: 'PENDING',
-  });
+  const verification = await verificationRepo.findPendingByDiscordId(discordId);
   if (!verification) {
     throw new NotFoundError(
       'Pending verification',
@@ -201,11 +191,12 @@ export async function completeVerification(discordId) {
     );
   }
 
-  // Expiry check.
-  if (verification.expiresAt < new Date()) {
-    verification.status = 'EXPIRED';
-    verification.failureReason = 'Code expired before /verify was run.';
-    await verification.save();
+  // Expiry check
+  if (new Date(verification.expires_at) < new Date()) {
+    await verificationRepo.updateById(verification.id, {
+      status: 'EXPIRED',
+      failureReason: 'Code expired before /verify was run.',
+    });
     throw new ValidationError(
       'Your verification code has expired. Run /link again to get a new one.'
     );
@@ -213,80 +204,76 @@ export async function completeVerification(discordId) {
 
   const { maxAttempts } = await getVerificationSettings();
   if (verification.attempts >= maxAttempts) {
-    verification.status = 'FAILED';
-    verification.failureReason = `Exceeded ${maxAttempts} verification attempts.`;
-    await verification.save();
+    await verificationRepo.updateById(verification.id, {
+      status: 'FAILED',
+      failureReason: 'Exceeded ' + maxAttempts + ' verification attempts.',
+    });
     throw new RateLimitError(
-      `Too many verification attempts. Run /link again to start over.`
+      'Too many verification attempts. Run /link again to start over.'
     );
   }
 
-  // Read the profile.
-  const profile = await robloxUserService.getProfile(verification.robloxId);
+  const profile = await robloxUserService.getProfile(verification.roblox_id);
   if (!profile) {
-    verification.attempts += 1;
-    await verification.save();
-    throw new NotFoundError('Roblox profile', { robloxId: verification.robloxId });
+    await verificationRepo.updateById(verification.id, {
+      attempts: verification.attempts + 1,
+    });
+    throw new NotFoundError('Roblox profile', { robloxId: verification.roblox_id });
   }
 
-  // The code must appear in the About field.
   const about = profile.description ?? '';
   const found = about.includes(verification.code);
 
   if (!found) {
-    verification.attempts += 1;
-    await verification.save();
+    await verificationRepo.updateById(verification.id, {
+      attempts: verification.attempts + 1,
+    });
     throw new ValidationError(
-      `Verification code not found in your Roblox profile. ` +
-      `Paste it in your About section and try again. ` +
-      `(${maxAttempts - verification.attempts} attempts left)`
+      'Verification code not found in your Roblox profile. ' +
+      'Paste it in your About section and try again. (' +
+      (maxAttempts - verification.attempts - 1) + ' attempts left)'
     );
   }
 
-  // Race check: another concurrent /verify might have linked this Roblox
-  // account to a different Discord just now. The unique index catches it,
-  // but we can pre-check to give a nicer error.
-  const alreadyLinked = await User.findOne({ robloxId: verification.robloxId });
-  if (alreadyLinked && alreadyLinked.discordId !== discordId) {
-    verification.status = 'FAILED';
-    verification.failureReason = 'Roblox account linked to another Discord during verification.';
-    await verification.save();
+  // Race check: another verify might have linked this Roblox account
+  const alreadyLinked = await userRepo.findByRobloxId(verification.roblox_id);
+  if (alreadyLinked && alreadyLinked.discord_id !== discordId) {
+    await verificationRepo.updateById(verification.id, {
+      status: 'FAILED',
+      failureReason: 'Roblox account linked to another Discord during verification.',
+    });
     throw new ConflictError(
       'That Roblox account was linked to another Discord account during verification.'
     );
   }
 
-  // Link!
   const { user } = await linkRobloxIdentity({
     discordId,
-    robloxId: verification.robloxId,
+    robloxId: verification.roblox_id,
     robloxUsername: profile.name,
     robloxDisplayName: profile.displayName,
     actorId: discordId,
     source: 'VERIFY',
   });
 
-  verification.status = 'VERIFIED';
-  verification.verifiedAt = new Date();
-  await verification.save();
+  await verificationRepo.updateById(verification.id, {
+    status: 'VERIFIED',
+    verifiedAt: new Date(),
+  });
 
   logger.info(
-    { discordId, robloxId: verification.robloxId, robloxUsername: profile.name },
+    { discordId, robloxId: verification.roblox_id, robloxUsername: profile.name },
     'Verification complete'
   );
 
-  return { user, robloxUser: profile, verification };
+  const reloaded = await verificationRepo.findById(verification.id);
+  return { user, robloxUser: profile, verification: reloaded };
 }
 
 // ============================================================
-//  Manual link (High Command+)
+//  Manual link
 // ============================================================
 
-/**
- * Manually link a Discord user to a Roblox account, bypassing the
- * code flow. Requires `verification.manualLink` permission — the
- * caller (Discord command) enforces that; this function trusts it.
- */
 export async function manualLink({
   actorId,
   targetDiscordId,
@@ -299,10 +286,10 @@ export async function manualLink({
     throw new ValidationError('A reason is required for manual linking.');
   }
 
-  const user = await User.findOne({ discordId: targetDiscordId });
+  const user = await userRepo.findByDiscordId(targetDiscordId);
   if (!user) throw new NotFoundError('User', { discordId: targetDiscordId });
 
-  if (user.robloxId) {
+  if (user.roblox_id) {
     throw new ConflictError(
       'User is already linked. Unlink first if you intend to change the account.'
     );
@@ -316,22 +303,16 @@ export async function manualLink({
     throw new ValidationError('That Roblox account is banned.');
   }
 
-  const existingLink = await User.findOne({ robloxId: String(robloxUser.id) });
+  const existingLink = await userRepo.findByRobloxId(String(robloxUser.id));
   if (existingLink) {
     throw new ConflictError(
       'That Roblox account is already linked to another Discord account.'
     );
   }
 
-  // Cancel any pending self-service verification for this user.
-  await Verification.updateMany(
-    { discordId: targetDiscordId, status: 'PENDING' },
-    {
-      $set: {
-        status: 'CANCELLED',
-        failureReason: `Superseded by manual link by ${actorId}`,
-      },
-    }
+  await verificationRepo.cancelPendingFor(
+    targetDiscordId,
+    'Superseded by manual link by ' + actorId
   );
 
   const { user: updated } = await linkRobloxIdentity({
@@ -356,67 +337,58 @@ export async function manualLink({
 //  /unlink
 // ============================================================
 
-/**
- * Unlink a Discord user from their Roblox account.
- * Only self-service in Phase 4 (D11). Admin unlink is deferred.
- */
 export async function unlinkSelf(discordId) {
-  const user = await User.findOne({ discordId });
+  const user = await userRepo.findByDiscordId(discordId);
   if (!user) throw new NotFoundError('User', { discordId });
-  if (!user.robloxId) {
+  if (!user.roblox_id) {
     throw new ValidationError('Your account is not linked.');
   }
 
-  const previousRobloxId = user.robloxId;
-  const previousRobloxUsername = user.robloxUsername;
+  const previousRobloxId = user.roblox_id;
+  const previousRobloxUsername = user.roblox_username;
 
-  // Clear Roblox identity; keep history in AuditLog.
-  user.robloxId = undefined;
-  user.robloxUsername = null;
-  user.set('roblox', {});
-  user.status = 'UNVERIFIED';
-  user.lastUnlinkedAt = new Date();
-  await user.save();
+  const updated = await userRepo.updateByDiscordId(discordId, {
+    robloxId: null,
+    robloxUsername: null,
+    robloxDisplayName: null,
+    robloxRankId: null,
+    robloxRankName: null,
+    robloxRankValue: null,
+    robloxLastSyncedAt: null,
+    status: 'UNVERIFIED',
+    lastUnlinkedAt: new Date(),
+  });
 
   await audit({
     actorId: discordId,
     action: 'verification.unlinked',
     category: 'USER',
     targetType: 'User',
-    targetId: user._id,
+    targetId: user.id,
     before: { robloxId: previousRobloxId, robloxUsername: previousRobloxUsername },
     after: { robloxId: null, status: 'UNVERIFIED' },
   });
 
   logger.info({ discordId, previousRobloxId }, 'User unlinked');
-  return user;
+  return updated;
 }
 
 // ============================================================
-//  Status inspection
+//  Status
 // ============================================================
 
 export async function getLinkStatus(discordId) {
   const [user, pending] = await Promise.all([
-    User.findOne({ discordId }).lean(),
-    Verification.findOne({ discordId, status: 'PENDING' }).lean(),
+    userRepo.findByDiscordId(discordId),
+    verificationRepo.findPendingByDiscordId(discordId),
   ]);
   return { user, pending };
 }
 
 // ============================================================
-//  Internal — the single write path that links an identity
+//  Internal — the single write path
 // ============================================================
 
-/**
- * The ONLY place that writes Roblox identity onto a User document.
- * Centralized so audits and future side-effects (role recompute,
- * welcome DM) happen exactly once.
- *
- * Idempotency:
- *   The `uniq_robloxId_sparse` index on User rejects a second Discord
- *   trying to link the same Roblox ID. We catch E11000 and translate.
- */
 async function linkRobloxIdentity({
   discordId,
   robloxId,
@@ -426,31 +398,25 @@ async function linkRobloxIdentity({
   source,
   reason = null,
 }) {
-  const user = await User.findOne({ discordId });
+  const user = await userRepo.findByDiscordId(discordId);
   if (!user) throw new NotFoundError('User', { discordId });
 
   const before = {
-    robloxId: user.robloxId,
-    robloxUsername: user.robloxUsername,
+    robloxId: user.roblox_id,
+    robloxUsername: user.roblox_username,
     status: user.status,
   };
 
-  user.robloxId = String(robloxId);
-  user.robloxUsername = robloxUsername;
-  user.set('roblox', {
-    username: robloxUsername,
-    displayName: robloxDisplayName ?? robloxUsername,
-    rankId: user.roblox?.rankId ?? null,
-    rankName: user.roblox?.rankName ?? null,
-    rankValue: user.roblox?.rankValue ?? null,
-    lastSyncedAt: user.roblox?.lastSyncedAt ?? null,
-  });
-  user.status = 'ACTIVE';
-
+  let updated;
   try {
-    await user.save();
+    updated = await userRepo.updateByDiscordId(discordId, {
+      robloxId: String(robloxId),
+      robloxUsername,
+      robloxDisplayName: robloxDisplayName ?? robloxUsername,
+      status: 'ACTIVE',
+    });
   } catch (err) {
-    if (err.code === 11000) {
+    if (err instanceof ConflictError) {
       throw new ConflictError(
         'That Roblox account is already linked to another Discord account.'
       );
@@ -463,16 +429,16 @@ async function linkRobloxIdentity({
     action: source === 'MANUAL' ? 'verification.manual_link' : 'verification.linked',
     category: 'USER',
     targetType: 'User',
-    targetId: user._id,
+    targetId: updated.id,
     before,
     after: {
-      robloxId: user.robloxId,
-      robloxUsername: user.robloxUsername,
-      status: user.status,
+      robloxId: updated.roblox_id,
+      robloxUsername: updated.roblox_username,
+      status: updated.status,
     },
     reason,
     context: { source },
   });
 
-  return { user };
+  return { user: updated };
 }

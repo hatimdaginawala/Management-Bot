@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as userService from '../../services/user.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { successEmbed, warningEmbed } from '../embedBuilders.js';
 import { dmExemptionRevoked } from '../utils/userDm.js';
@@ -10,14 +10,14 @@ export const customId = 'quota:unexempt:user';
 export const meta = {};
 
 export async function execute(interaction) {
-  const actor = await User.findOne({ discordId: interaction.user.id });
+  const actor = await userRepo.findByDiscordId(interaction.user.id);
   if (!actor) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(actor._id, 'quota.exempt');
+  const ok = await permissionService.hasPermission(actor.id, 'quota.exempt');
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 
   const targetDiscordId = interaction.values[0];
 
-  const target = await User.findOne({ discordId: targetDiscordId }).lean();
+  const target = await userRepo.findByDiscordId(targetDiscordId);
   if (!target) {
     return interaction.update({
       embeds: [warningEmbed({
@@ -28,7 +28,7 @@ export async function execute(interaction) {
     });
   }
 
-  const wasExempt = Boolean(target.quota && target.quota.exempt);
+  const wasExempt = Boolean(target.quota_exempt);
   if (!wasExempt) {
     return interaction.update({
       embeds: [warningEmbed({

@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as userService from '../../services/user.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import { successEmbed, errorEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
@@ -11,9 +11,9 @@ export const customId = 'modal:quota-exempt-reason';
 export const meta = {};
 
 export async function execute(interaction) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'quota.exempt');
+  const ok = await permissionService.hasPermission(user.id, 'quota.exempt');
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 
   const session = sessions.getSession('quota:exempt', interaction.user.id);
@@ -35,7 +35,7 @@ export async function execute(interaction) {
 
   await dmExemptionGranted(interaction.client, session.userId, {
     reason,
-    exemptUntil: target?.quota?.exemptUntil ?? null,
+    exemptUntil: target?.quota_exempt_until ?? null,
     actorId: interaction.user.id,
   });
 

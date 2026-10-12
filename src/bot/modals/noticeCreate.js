@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as noticeService from '../../services/notice.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import { successEmbed, errorEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
@@ -11,9 +11,9 @@ export const customId = 'modal:notice-create';
 export const meta = {};
 
 export async function execute(interaction) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'notice.create');
+  const ok = await permissionService.hasPermission(user.id, 'notice.create');
   if (!ok) throw new AuthorizationError('You do not have permission to create notices.');
 
   const session = sessions.getSession('notice:create', interaction.user.id);
@@ -57,7 +57,6 @@ export async function execute(interaction) {
 
   sessions.clearSession('notice:create', interaction.user.id);
 
-  // DM the target user.
   await dmNoticeCreated(interaction.client, notice, { actorId: interaction.user.id });
 
   return interaction.editReply({
@@ -66,8 +65,8 @@ export async function execute(interaction) {
       description: 'A notice has been created for <@' + session.userId + '>.',
       fields: [
         { name: 'Type', value: '`' + notice.type + '`', inline: true },
-        { name: 'Exempt', value: notice.grantsQuotaExemption ? 'yes' : 'no', inline: true },
-        ...(notice.endAt ? [{ name: 'Ends', value: '<t:' + Math.floor(new Date(notice.endAt).getTime() / 1000) + ':d>', inline: true }] : []),
+        { name: 'Exempt', value: notice.grants_quota_exemption ? 'yes' : 'no', inline: true },
+        ...(notice.end_at ? [{ name: 'Ends', value: '<t:' + Math.floor(new Date(notice.end_at).getTime() / 1000) + ':d>', inline: true }] : []),
       ],
     })],
   });

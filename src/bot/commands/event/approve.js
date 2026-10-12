@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as eventService from '../../../services/event.service.js';
 import * as permissionService from '../../../services/permission.service.js';
-import { User } from '../../../models/index.js';
+import * as userRepo from '../../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../../utils/errors.js';
 import { infoEmbed, successEmbed } from '../../embedBuilders.js';
 import { showEventPicker, formatEventSummary } from '../../components/eventPicker.js';
@@ -29,7 +29,7 @@ export async function handleApprove(interaction) {
     const event = result.items[0];
     const { alreadyApproved } = await eventService.approveEvent(
       interaction.user.id,
-      event._id
+      event.id
     );
     return interaction.reply({
       embeds: [successEmbed({
@@ -49,11 +49,11 @@ export async function handleApprove(interaction) {
 }
 
 export async function assertPermission(interaction, permissionKey) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) {
     throw new AuthorizationError('You do not have permission to perform this action.');
   }
-  const ok = await permissionService.hasPermission(user._id, permissionKey);
+  const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) {
     throw new AuthorizationError('You do not have permission to perform this action.');
   }

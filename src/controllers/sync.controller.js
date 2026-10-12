@@ -1,5 +1,5 @@
 import { runJobSync } from '../jobs/runner.js';
-import { SyncLog } from '../models/index.js';
+import * as syncLogRepo from '../db/repositories/syncLog.repository.js';
 
 export async function trigger(req, res) {
   const result = await runJobSync('roblox-sync', {
@@ -9,8 +9,6 @@ export async function trigger(req, res) {
 }
 
 export async function status(req, res) {
-  const latest = await SyncLog.findOne({ type: 'ROBLOX_GROUP_SYNC' })
-    .sort({ startedAt: -1 })
-    .lean();
+  const latest = await syncLogRepo.findLatest('ROBLOX_GROUP_SYNC');
   res.json({ success: true, data: latest || null });
 }

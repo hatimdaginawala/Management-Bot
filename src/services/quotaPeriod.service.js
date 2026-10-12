@@ -1,193 +1,204 @@
-import { QuotaPeriod, QuotaPolicy, Settings } from '../models/index.js';
+import * as quotaPeriodRepo from '../db/repositories/quotaPeriod.repository.js';
+import * as quotaPolicyRepo from '../db/repositories/quotaPolicy.repository.js';
+import * as quotaPeriodPolicyRepo from '../db/repositories/quotaPeriodPolicy.repository.js';
+import * as settingsRepo from '../db/repositories/settings.repository.js';
 import { audit } from '../utils/audit.js';
 import { isoWeekKey, isoWeekBounds, boundsFromKey, nextKey } from '../utils/isoWeek.js';
 import { NotFoundError, ConflictError } from '../utils/errors.js';
+import { db } from '../db/client.js';
 import logger from '../config/logger.js';
 
 /**
- * Quota period service.
+ * Quota period service. Public API unchanged.
  *
- * A period is one ISO week. Deterministic key (e.g. "2026-W41").
- * Status lifecycle:
- *   OPEN     → the current week, accepting events/attendance
- *   CLOSING  → being evaluated (evaluation service holds this briefly)
- *   CLOSED   → evaluated; historical
- *
- * The `policies` array on each period is a SNAPSHOT of the open policies
- * for each category at the moment the period was first opened. This is
- * the anchor for `.txt §21` ("changing the quota next week must not
- * rewrite historical quota results").
+ * Policy snapshot at open time is stored in quota_period_policies.
+ * The snapshot is what evaluation reads — historical results never
+ * drift when policies change.
  */
 
-/**
- * Return the currently OPEN period, or null.
- */
+const CATEGORIES = ['STAFF', 'LOW_RANK'];
+
+// ============================================================
+//  Reads
+// ============================================================
+
 export async function getCurrentPeriod() {
-  return QuotaPeriod.findOne({ status: 'OPEN' }).sort({ startAt: -1 }).lean();
+  const period = await quotaPeriodRepo.findCurrentOpen();
+  if (!period) return null;
+  return attachPolicies(period);
 }
 
-/**
- * Return the OPEN period. If none exists, create it for the current
- * calendar week. This is the only place a period is opened.
- *
- * Never mutates an existing OPEN period.
- */
+export async function getPeriodByKey(key) {
+  const period = await quotaPeriodRepo.findByKey(key);
+  if (!period) throw new NotFoundError('Quota period', { key });
+  return attachPolicies(period);
+}
+
+async function attachPolicies(period) {
+  const policies = await quotaPeriodPolicyRepo.listByPeriod(period.id);
+  return {
+    ...period,
+    policies: policies.map((p) => ({
+      policyId: p.policy_id,
+      category: p.category,
+      metric: p.metric,
+      amount: p.amount,
+      recoveryMultiplier: p.recovery_multiplier,
+    })),
+  };
+}
+
+// ============================================================
+//  Open / create
+// ============================================================
+
 export async function getOrCreateCurrentPeriod({ actorId = 'system' } = {}) {
-  const existing = await QuotaPeriod.findOne({ status: 'OPEN' });
-  if (existing) return existing;
+  const existing = await quotaPeriodRepo.findCurrentOpen();
+  if (existing) return attachPolicies(existing);
 
   const now = new Date();
   const key = isoWeekKey(now);
   const { startAt, endAt } = isoWeekBounds(now);
 
-  // Snapshot current policies.
-  const categories = ['STAFF', 'LOW_RANK'];
-  const policies = [];
-  for (const category of categories) {
-    const p = await QuotaPolicy.findOne({ category, active: true, effectiveTo: null }).lean();
-    if (p) {
-      policies.push({
-        policyId: p._id,
-        category: p.category,
-        metric: p.metric,
-        amount: p.amount,
-        recoveryMultiplier: p.recoveryMultiplier,
-      });
+  const result = await db.transaction(async (trx) => {
+    // Snapshot current open policies.
+    const policies = [];
+    for (const category of CATEGORIES) {
+      const p = await quotaPolicyRepo.findActiveForCategory(category);
+      if (p) {
+        policies.push({
+          policyId: p.id,
+          category: p.category,
+          metric: p.metric,
+          amount: p.amount,
+          recoveryMultiplier: p.recovery_multiplier,
+        });
+      }
     }
-  }
 
-  try {
-    const period = await QuotaPeriod.create({
+    const period = await quotaPeriodRepo.create({
       periodKey: key,
       startAt,
       endAt,
-      policies,
       status: 'OPEN',
-    });
+    }, trx);
 
-    // Best-effort: record in Settings for /quota status.
-    await Settings.updateOne(
-      { key: 'global' },
-      { $set: { 'quotas.currentPeriodKey': key } }
-    );
+    await quotaPeriodPolicyRepo.replaceForPeriod(period.id, policies, trx);
 
-    await audit({
-      actorId,
-      action: 'quota.period_opened',
-      category: 'QUOTA',
-      targetType: 'QuotaPeriod',
-      targetId: period._id,
-      after: { periodKey: key, startAt, endAt, policies: policies.length },
-    });
-
-    logger.info({ periodKey: key, policies: policies.length }, 'Quota period opened');
-    return period.toObject();
-  } catch (err) {
-    if (err.code === 11000) {
-      // Concurrent open won; return the winner.
-      return QuotaPeriod.findOne({ periodKey: key }).lean();
+    return { period, policies };
+  }).catch(async (err) => {
+    // Duplicate key — another caller won the race. Reload.
+    if (err.code === 'ER_DUP_ENTRY' || err.errno === 1062) {
+      const winner = await quotaPeriodRepo.findByKey(key);
+      if (winner) return { period: winner };
     }
     throw err;
-  }
-}
+  });
 
-/**
- * Look up a period by its key.
- */
-export async function getPeriodByKey(key) {
-  const p = await QuotaPeriod.findOne({ periodKey: key }).lean();
-  if (!p) throw new NotFoundError('Quota period', { key });
-  return p;
-}
+  // Best-effort settings update for /quota status
+  await settingsRepo.upsert('quotas.currentPeriodKey', 'quotas', key, 'string', {
+    updatedBy: actorId,
+  }).catch(() => {});
 
-/**
- * Atomically transition OPEN → CLOSING.
- * Returns the period on success, or null if it wasn't OPEN.
- */
-export async function acquireClosingLock(key) {
-  return QuotaPeriod.findOneAndUpdate(
-    { periodKey: key, status: 'OPEN' },
-    { $set: { status: 'CLOSING' } },
-    { new: true }
+  await audit({
+    actorId,
+    action: 'quota.period_opened',
+    category: 'QUOTA',
+    targetType: 'QuotaPeriod',
+    targetId: result.period.id,
+    after: {
+      periodKey: key,
+      startAt,
+      endAt,
+      policies: result.policies?.length ?? 0,
+    },
+  });
+
+  logger.info(
+    { periodKey: key, policies: result.policies?.length ?? 0 },
+    'Quota period opened'
   );
+
+  return attachPolicies(result.period);
 }
 
-/**
- * Mark a period CLOSED with evaluation metadata.
- */
+export async function openNextPeriod(afterKey, { actorId = 'system' } = {}) {
+  const key = nextKey(afterKey);
+
+  const existing = await quotaPeriodRepo.findByKey(key);
+  if (existing) return attachPolicies(existing);
+
+  const { startAt, endAt } = boundsFromKey(key);
+
+  const result = await db.transaction(async (trx) => {
+    const policies = [];
+    for (const category of CATEGORIES) {
+      const p = await quotaPolicyRepo.findActiveForCategory(category);
+      if (p) {
+        policies.push({
+          policyId: p.id,
+          category: p.category,
+          metric: p.metric,
+          amount: p.amount,
+          recoveryMultiplier: p.recovery_multiplier,
+        });
+      }
+    }
+
+    const period = await quotaPeriodRepo.create({
+      periodKey: key,
+      startAt,
+      endAt,
+      status: 'OPEN',
+    }, trx);
+
+    await quotaPeriodPolicyRepo.replaceForPeriod(period.id, policies, trx);
+
+    return { period, policies };
+  }).catch(async (err) => {
+    if (err.code === 'ER_DUP_ENTRY' || err.errno === 1062) {
+      const winner = await quotaPeriodRepo.findByKey(key);
+      if (winner) return { period: winner };
+    }
+    throw err;
+  });
+
+  await settingsRepo.upsert('quotas.currentPeriodKey', 'quotas', key, 'string', {
+    updatedBy: actorId,
+  }).catch(() => {});
+
+  await audit({
+    actorId,
+    action: 'quota.period_opened',
+    category: 'QUOTA',
+    targetType: 'QuotaPeriod',
+    targetId: result.period.id,
+    after: { periodKey: key, startAt, endAt },
+  });
+
+  return attachPolicies(result.period);
+}
+
+// ============================================================
+//  Close
+// ============================================================
+
+export async function acquireClosingLock(key) {
+  const period = await quotaPeriodRepo.acquireClosingLock(key);
+  if (!period) return null;
+  return attachPolicies(period);
+}
+
 export async function finalizePeriod(key, {
   evaluatedCount = 0,
   strikesIssuedCount = 0,
   recoveriesAppliedCount = 0,
 } = {}) {
-  const p = await QuotaPeriod.findOneAndUpdate(
-    { periodKey: key, status: 'CLOSING' },
-    {
-      $set: {
-        status: 'CLOSED',
-        closedAt: new Date(),
-        evaluatedCount,
-        strikesIssuedCount,
-        recoveriesAppliedCount,
-      },
-    },
-    { new: true }
-  );
-  if (!p) throw new ConflictError(`Period ${key} is not in CLOSING state.`);
-  return p;
-}
-
-/**
- * Open the period that follows the given one.
- * Idempotent — if the next period already exists, returns it.
- */
-export async function openNextPeriod(afterKey, { actorId = 'system' } = {}) {
-  const key = nextKey(afterKey);
-  const existing = await QuotaPeriod.findOne({ periodKey: key });
-  if (existing) return existing.toObject();
-
-  const { startAt, endAt } = boundsFromKey(key);
-
-  const categories = ['STAFF', 'LOW_RANK'];
-  const policies = [];
-  for (const category of categories) {
-    const p = await QuotaPolicy.findOne({ category, active: true, effectiveTo: null }).lean();
-    if (p) {
-      policies.push({
-        policyId: p._id,
-        category: p.category,
-        metric: p.metric,
-        amount: p.amount,
-        recoveryMultiplier: p.recoveryMultiplier,
-      });
-    }
-  }
-
-  try {
-    const period = await QuotaPeriod.create({
-      periodKey: key,
-      startAt,
-      endAt,
-      policies,
-      status: 'OPEN',
-    });
-    await Settings.updateOne(
-      { key: 'global' },
-      { $set: { 'quotas.currentPeriodKey': key } }
-    );
-    await audit({
-      actorId,
-      action: 'quota.period_opened',
-      category: 'QUOTA',
-      targetType: 'QuotaPeriod',
-      targetId: period._id,
-      after: { periodKey: key, startAt, endAt },
-    });
-    return period.toObject();
-  } catch (err) {
-    if (err.code === 11000) {
-      return QuotaPeriod.findOne({ periodKey: key }).lean();
-    }
-    throw err;
-  }
+  const p = await quotaPeriodRepo.finalizePeriod(key, {
+    evaluatedCount,
+    strikesIssuedCount,
+    recoveriesAppliedCount,
+  });
+  if (!p) throw new ConflictError('Period ' + key + ' is not in CLOSING state.');
+  return attachPolicies(p);
 }

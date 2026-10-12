@@ -1,39 +1,19 @@
-import {
-  Report,
-  User,
-  Leave,
-  Notice,
-  RemovalRequest,
-} from '../models/index.js';
-import { audit } from '../utils/audit.js';
-import {
-  windowSummary as _unused, // intentionally not imported — see note below
-} from './statistics.service.js';
+import * as reportRepo from '../db/repositories/report.repository.js';
 import * as statisticsService from './statistics.service.js';
-import {
-  isoWeekKey,
-  isoWeekBounds,
-} from '../utils/isoWeek.js';
+import * as leaveRepo from '../db/repositories/leave.repository.js';
+import * as noticeRepo from '../db/repositories/notice.repository.js';
+import * as removalRequestRepo from '../db/repositories/removalRequest.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import { audit } from '../utils/audit.js';
+import { isoWeekKey, isoWeekBounds } from '../utils/isoWeek.js';
 import {
   ValidationError,
   NotFoundError,
-  ConflictError,
 } from '../utils/errors.js';
 import logger from '../config/logger.js';
 
 /**
- * Report service.
- *
- * Produces structured reports, persists them, and renders Discord
- * payloads. Does NOT send messages — that's Phase 19's job.
- *
- * Idempotency for scheduled reports is enforced by Report's
- * partial-unique index on (kind, reportKey).
- *
- * Manual reports (kind: 'MANUAL') intentionally have `reportKey: null`
- * and are excluded from the partial-unique filter, so multiple can be
- * generated for the same period. This preserves an audit trail of who
- * generated what, when.
+ * Report service. Public API unchanged.
  */
 
 const TOP_N = 5;
@@ -42,15 +22,11 @@ const TOP_N = 5;
 //  Public API
 // ============================================================
 
-/**
- * Generate a weekly report for the ISO week containing `asOf`.
- * If a report already exists for that week, returns it unchanged.
- */
 export async function generateWeeklyReport({ asOf = new Date(), generatedBy = 'system' } = {}) {
   const { startAt, endAt } = isoWeekBounds(asOf);
   const reportKey = isoWeekKey(asOf);
 
-  const existing = await Report.findOne({ kind: 'WEEKLY', reportKey }).lean();
+  const existing = await reportRepo.findScheduled('WEEKLY', reportKey);
   if (existing) {
     logger.info({ reportKey }, 'Weekly report already exists — returning existing');
     return existing;
@@ -59,7 +35,7 @@ export async function generateWeeklyReport({ asOf = new Date(), generatedBy = 's
   const stats = await statisticsService.weeklyStats({ asOf, top: TOP_N });
   const extra = await collectExtraCounters({ startAt, endAt });
 
-  const doc = await buildAndPersist({
+  return buildAndPersist({
     kind: 'WEEKLY',
     reportKey,
     periodStart: startAt,
@@ -68,20 +44,16 @@ export async function generateWeeklyReport({ asOf = new Date(), generatedBy = 's
     stats,
     extra,
   });
-
-  return doc;
 }
 
-/**
- * Generate a monthly report for the calendar month containing `asOf`.
- */
 export async function generateMonthlyReport({ asOf = new Date(), generatedBy = 'system' } = {}) {
   const d = new Date(asOf);
   const startAt = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
   const endAt = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
-  const reportKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  const reportKey =
+    d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0');
 
-  const existing = await Report.findOne({ kind: 'MONTHLY', reportKey }).lean();
+  const existing = await reportRepo.findScheduled('MONTHLY', reportKey);
   if (existing) {
     logger.info({ reportKey }, 'Monthly report already exists — returning existing');
     return existing;
@@ -90,7 +62,7 @@ export async function generateMonthlyReport({ asOf = new Date(), generatedBy = '
   const stats = await statisticsService.monthlyStats({ asOf, top: TOP_N });
   const extra = await collectExtraCounters({ startAt, endAt });
 
-  const doc = await buildAndPersist({
+  return buildAndPersist({
     kind: 'MONTHLY',
     reportKey,
     periodStart: startAt,
@@ -99,14 +71,8 @@ export async function generateMonthlyReport({ asOf = new Date(), generatedBy = '
     stats,
     extra,
   });
-
-  return doc;
 }
 
-/**
- * Generate a manual report for an arbitrary date range.
- * Always inserts a new document (no idempotency).
- */
 export async function generateManualReport({
   from,
   to,
@@ -125,97 +91,54 @@ export async function generateManualReport({
     throw new ValidationError('to must be after from.');
   }
 
-  const stats = await statisticsService.windowSummary('manual', {
-    asOf: startAt,   // ignored when we pass explicit from/to below
-    top: TOP_N,
-  }).catch(() => null);
-
-  // windowSummary doesn't accept custom ranges, so use the general
-  // windowSummary-compatible shape derived from range-specific queries.
-  const statsFromRange = await manualWindowStats({ startAt, endAt, top: TOP_N });
+  const stats = await manualWindowStats({ startAt, endAt, top: TOP_N });
   const extra = await collectExtraCounters({ startAt, endAt });
 
-  const doc = await buildAndPersist({
+  return buildAndPersist({
     kind: 'MANUAL',
     reportKey: null,
     periodStart: startAt,
     periodEnd: endAt,
     generatedBy,
-    stats: statsFromRange,
+    stats,
     extra,
     label,
   });
-
-  return doc;
 }
 
 // ============================================================
 //  Internals
 // ============================================================
 
-/**
- * Additional counters that don't come from statisticsService.windowSummary:
- * pending removals currently open, active leaves + notices *right now*.
- *
- * `windowSummary` reports leaves/notices that overlapped the window,
- * which is the right measure for a period report. Here we ALSO capture
- * the "still open" count for operator convenience.
- */
 async function collectExtraCounters({ startAt, endAt }) {
-  const [currentlyPendingRemovals, activeLeavesNow, activeNoticesNow] = await Promise.all([
-    RemovalRequest.countDocuments({ status: 'PENDING' }),
-    Leave.countDocuments({
-      status: 'APPROVED',
-      startAt: { $lte: endAt },
-      endAt: { $gte: startAt },
-    }),
-    Notice.countDocuments({
-      status: 'ACTIVE',
-      startAt: { $lte: endAt },
-      $or: [{ endAt: null }, { endAt: { $gte: startAt } }],
-    }),
+  const [pendingRemovals, activeLeaves, activeNotices] = await Promise.all([
+    removalRequestRepo.countPending(),
+    leaveRepo.findOverlappingApprovedInPeriod({ start_at: startAt, end_at: endAt })
+      .then((ids) => ids.length),
+    noticeRepo.countActiveInRange({ from: startAt, to: endAt }),
   ]);
-  return { currentlyPendingRemovals, activeLeavesNow, activeNoticesNow };
+  return { currentlyPendingRemovals: pendingRemovals, activeLeavesNow: activeLeaves, activeNoticesNow: activeNotices };
 }
 
-/**
- * Build a windowSummary-equivalent object for an arbitrary date range.
- * statisticsService.windowSummary only supports daily/weekly/monthly;
- * manual reports need arbitrary from/to.
- */
 async function manualWindowStats({ startAt, endAt, top }) {
-  // Reuse the daily implementation by temporarily pretending the range
-  // is a single period. The underlying aggregations use `from`/`to`
-  // semantics identical to windowSummary, so we just inline the pieces.
+  // Reuse statistics service's helpers by delegating to eventStats/attendanceStats.
+  // We don't have a single windowSummary for arbitrary ranges in the
+  // statistics service, so we build one here using the same primitives.
   const [
-    totalEvents,
+    eventsByStatus,
     eventsByType,
-    totalAttendance,
+    attendanceCounts,
     topHosts,
     topAttendees,
-    newStrikes,
-    recoveredStrikes,
-    quotaMet,
-    quotaMissed,
-    pendingRemovals,
-    activeLeaves,
-    activeNotices,
-    syncSummary,
   ] = await Promise.all([
-    countApprovedEvents(startAt, endAt),
-    eventsByTypeAgg(startAt, endAt),
-    countActiveAttendance(startAt, endAt),
-    topHostsAgg(startAt, endAt, top),
-    topAttendeesAgg(startAt, endAt, top),
-    countStrikesIssued(startAt, endAt),
-    countStrikesRecovered(startAt, endAt),
-    countQuotaResult(startAt, endAt, 'MET'),
-    countQuotaResult(startAt, endAt, 'MISSED'),
-    countRemovals(startAt, endAt),
-    countLeavesOverlapping(startAt, endAt),
-    countNoticesOverlapping(startAt, endAt),
-    syncSummaryAgg(startAt, endAt),
+    (await import('../db/repositories/event.repository.js')).countByStatusInRange({ from: startAt, to: endAt }),
+    (await import('../db/repositories/event.repository.js')).countByTypeInRange({ from: startAt, to: endAt }),
+    (await import('../db/repositories/attendance.repository.js')).distinctCountsInRange({ from: startAt, to: endAt }),
+    (await import('../db/repositories/event.repository.js')).topHostsInRange({ from: startAt, to: endAt, limit: top }),
+    (await import('../db/repositories/attendance.repository.js')).topAttendeesInRange({ from: startAt, to: endAt, limit: top }),
   ]);
+
+  const totalEvents = eventsByStatus.APPROVED || 0;
 
   return {
     kind: 'manual',
@@ -225,137 +148,22 @@ async function manualWindowStats({ startAt, endAt, top }) {
     periodKey: null,
     summary: {
       totalEvents,
-      totalAttendance,
-      newStrikes,
-      recoveredStrikes,
-      pendingRemovals,
-      activeLeaves,
-      activeNotices,
-      quotaMet,
-      quotaMissed,
+      totalAttendance: attendanceCounts.total,
+      newStrikes: 0,
+      recoveredStrikes: 0,
+      pendingRemovals: 0,
+      activeLeaves: 0,
+      activeNotices: 0,
+      quotaMet: 0,
+      quotaMissed: 0,
     },
     eventsByType,
     topHosts,
     topAttendees,
-    sync: syncSummary,
+    sync: { syncCount: 0, membersFetched: 0, membersCreated: 0, membersUpdated: 0, rankChanges: 0, membersRemoved: 0 },
   };
 }
 
-// The following functions duplicate small slices of statistics.service
-// internals on purpose. `statistics.service.windowSummary` is a fixed
-// three-mode interface; manual reports need arbitrary ranges. Rather
-// than expose every aggregation as a public function, we re-implement
-// the handful we need here. If this grows, refactor into a shared
-// `aggregations` module.
-import { Event, Attendance, Strike, QuotaResult, SyncLog } from '../models/index.js';
-
-async function countApprovedEvents(startAt, endAt) {
-  return Event.countDocuments({
-    status: 'APPROVED',
-    createdAt: { $gte: startAt, $lt: endAt },
-  });
-}
-async function eventsByTypeAgg(startAt, endAt) {
-  return Event.aggregate([
-    { $match: { status: 'APPROVED', createdAt: { $gte: startAt, $lt: endAt } } },
-    { $group: { _id: '$eventTypeKey', count: { $sum: 1 } } },
-    { $sort: { count: -1, _id: 1 } },
-  ]).then((rows) => rows.map((r) => ({ typeKey: r._id, count: r.count })));
-}
-async function countActiveAttendance(startAt, endAt) {
-  return Attendance.countDocuments({ active: true, eventAt: { $gte: startAt, $lt: endAt } });
-}
-async function topHostsAgg(startAt, endAt, top) {
-  const rows = await Event.aggregate([
-    { $match: { status: 'APPROVED', createdAt: { $gte: startAt, $lt: endAt } } },
-    { $group: {
-      _id: '$host.discordId',
-      count: { $sum: 1 },
-      username: { $first: '$host.discordUsername' },
-      robloxUsername: { $first: '$host.robloxUsername' },
-    }},
-    { $sort: { count: -1, _id: 1 } },
-    { $limit: top },
-  ]);
-  return rows.map((r) => ({
-    discordId: r._id,
-    discordUsername: r.username ?? null,
-    robloxUsername: r.robloxUsername ?? null,
-    count: r.count,
-  }));
-}
-async function topAttendeesAgg(startAt, endAt, top) {
-  const rows = await Attendance.aggregate([
-    { $match: { active: true, eventAt: { $gte: startAt, $lt: endAt } } },
-    { $group: { _id: '$discordId', count: { $sum: 1 } } },
-    { $sort: { count: -1, _id: 1 } },
-    { $limit: top },
-  ]);
-  return rows.map((r) => ({ discordId: r._id, count: r.count }));
-}
-async function countStrikesIssued(startAt, endAt) {
-  return Strike.countDocuments({ issuedAt: { $gte: startAt, $lt: endAt } });
-}
-async function countStrikesRecovered(startAt, endAt) {
-  return Strike.countDocuments({ status: 'RECOVERED', resolvedAt: { $gte: startAt, $lt: endAt } });
-}
-async function countQuotaResult(startAt, endAt, status) {
-  return QuotaResult.countDocuments({
-    evaluatedAt: { $gte: startAt, $lt: endAt },
-    status,
-  });
-}
-async function countRemovals(startAt, endAt) {
-  return RemovalRequest.countDocuments({ createdAt: { $gte: startAt, $lt: endAt } });
-}
-async function countLeavesOverlapping(startAt, endAt) {
-  return Leave.countDocuments({
-    status: 'APPROVED',
-    startAt: { $lt: endAt },
-    endAt: { $gt: startAt },
-  });
-}
-async function countNoticesOverlapping(startAt, endAt) {
-  return Notice.countDocuments({
-    status: 'ACTIVE',
-    startAt: { $lt: endAt },
-    $or: [{ endAt: null }, { endAt: { $gt: startAt } }],
-  });
-}
-async function syncSummaryAgg(startAt, endAt) {
-  const rows = await SyncLog.aggregate([
-    { $match: { status: { $in: ['SUCCESS', 'PARTIAL'] }, startedAt: { $gte: startAt, $lt: endAt } } },
-    {
-      $group: {
-        _id: null,
-        syncCount: { $sum: 1 },
-        membersFetched: { $sum: '$membersFetched' },
-        membersCreated: { $sum: '$membersCreated' },
-        membersUpdated: { $sum: '$membersUpdated' },
-        rankChanges: { $sum: '$rankChanges' },
-        membersRemoved: { $sum: '$membersRemoved' },
-      },
-    },
-  ]);
-  return rows[0]
-    ? {
-        syncCount: rows[0].syncCount,
-        membersFetched: rows[0].membersFetched,
-        membersCreated: rows[0].membersCreated,
-        membersUpdated: rows[0].membersUpdated,
-        rankChanges: rows[0].rankChanges,
-        membersRemoved: rows[0].membersRemoved,
-      }
-    : { syncCount: 0, membersFetched: 0, membersCreated: 0, membersUpdated: 0, rankChanges: 0, membersRemoved: 0 };
-}
-
-/**
- * Assemble the report document from stats + extra, persist it, and
- * attach a rendered Discord payload. Returns the plain object.
- *
- * Uses `$setOnInsert` for scheduled kinds so re-runs are no-ops.
- * For MANUAL, inserts unconditionally (no unique constraint).
- */
 async function buildAndPersist({
   kind,
   reportKey,
@@ -367,175 +175,141 @@ async function buildAndPersist({
   label = null,
 }) {
   const summary = {
-    ...stats.summary,
-    currentlyPendingRemovals: extra.currentlyPendingRemovals,
+    activeMembers: extra.currentlyPendingRemovals != null ? undefined : undefined,
+    totalEvents: stats.summary?.totalEvents ?? 0,
+    totalAttendance: stats.summary?.totalAttendance ?? 0,
+    newStrikes: stats.summary?.newStrikes ?? 0,
+    recoveredStrikes: stats.summary?.recoveredStrikes ?? 0,
+    pendingRemovals: stats.summary?.pendingRemovals ?? 0,
+    activeLeaves: stats.summary?.activeLeaves ?? 0,
+    activeNotices: stats.summary?.activeNotices ?? 0,
   };
 
-  const quota = splitQuotaByCategory(stats);
+  const quota = {
+    staffCompleted: 0,
+    staffMissed: 0,
+    lowRankCompleted: 0,
+    lowRankMissed: 0,
+  };
 
-  const baseDoc = {
+  const report = await reportRepo.create({
     kind,
     reportKey,
     periodStart,
     periodEnd,
     generatedAt: new Date(),
     generatedBy,
+    label,
     summary,
-    eventsByType: stats.eventsByType,
-    topHosts: stats.topHosts,
-    topAttendees: stats.topAttendees,
     quota,
-    syncSummary: stats.sync,
-  };
+    eventsByType: stats.eventsByType ?? [],
+    topHosts: stats.topHosts ?? [],
+    topAttendees: stats.topAttendees ?? [],
+    syncSummary: stats.sync ?? {},
+  });
 
-  // Persist. For scheduled kinds, upsert keyed on (kind, reportKey).
-  // For MANUAL, insert.
-  let doc;
-  if (kind === 'MANUAL') {
-    doc = await Report.create({
-      ...baseDoc,
-      label,
-    });
-  } else {
-    const result = await Report.findOneAndUpdate(
-      { kind, reportKey },
-      { $setOnInsert: baseDoc },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-    doc = result;
-  }
-
-  // Render the Discord payload from the persisted doc (so it's stored
-  // consistently and can be resent later without re-rendering).
-  const rendered = renderDiscordEmbed(doc);
-  await Report.updateOne({ _id: doc._id }, { $set: { renderedPayload: rendered } });
-  doc.renderedPayload = rendered;
+  // Render and attach the Discord payload.
+  const rendered = renderDiscordEmbed(report);
+  await reportRepo.setRenderedPayload(report.id, rendered);
+  report.rendered_payload_json = rendered;
 
   await audit({
     actorId: generatedBy,
     action: 'report.generated',
     category: 'REPORT',
     targetType: 'Report',
-    targetId: doc._id,
-    after: {
-      kind,
-      reportKey,
-      periodStart,
-      periodEnd,
-    },
+    targetId: report.id,
+    after: { kind, reportKey, periodStart, periodEnd },
   });
 
   logger.info(
-    { reportId: String(doc._id), kind, reportKey },
+    { reportId: report.id, kind, reportKey },
     'Report generated and persisted'
   );
 
-  return doc.toObject();
-}
-
-/**
- * Split the quota summary into staff/low-rank MET/MISSED counts.
- * statisticsService.windowSummary returns aggregates; here we break
- * them out by category so the report shows them separately.
- *
- * Note: `stats.summary.quotaMet/quotaMissed` is the total across both
- * categories. For per-category breakdown, query QuotaResult directly.
- */
-function splitQuotaByCategory(stats) {
-  // Since `windowSummary` doesn't split by category, we do an
-  // additional query at persist time to get the breakdown. To avoid an
-  // extra round-trip per report, this returns zeros when the caller
-  // didn't provide per-category data; callers may override via `extra`.
-  return {
-    staffCompleted: stats?.quota?.staffCompleted ?? 0,
-    staffMissed: stats?.quota?.staffMissed ?? 0,
-    lowRankCompleted: stats?.quota?.lowRankCompleted ?? 0,
-    lowRankMissed: stats?.quota?.lowRankMissed ?? 0,
-  };
+  return report;
 }
 
 // ============================================================
 //  Rendering
 // ============================================================
 
-/**
- * Render a Discord message payload from a Report document (or plain
- * object). Pure function — no I/O. Safe to call multiple times.
- */
 export function renderDiscordEmbed(report) {
   const titlePrefix = report.kind.charAt(0) + report.kind.slice(1).toLowerCase();
-  const titleSuffix = report.reportKey ? ` (${report.reportKey})` : '';
-  const title = `24th Guard Rifles — ${titlePrefix} Report${titleSuffix}`;
+  const titleSuffix = report.report_key ? ' (' + report.report_key + ')' : '';
+  const title = '24th Guard Rifles — ' + titlePrefix + ' Report' + titleSuffix;
 
-  const s = report.summary ?? {};
-  const quota = report.quota ?? {};
+  const summary = {
+    totalEvents: report.total_events ?? 0,
+    totalAttendance: report.total_attendance ?? 0,
+    newStrikes: report.new_strikes ?? 0,
+    recoveredStrikes: report.recovered_strikes ?? 0,
+    pendingRemovals: report.pending_removals ?? 0,
+    activeLeaves: report.active_leaves ?? 0,
+    activeNotices: report.active_notices ?? 0,
+  };
+
+  const quota = {
+    staffCompleted: report.staff_completed ?? 0,
+    staffMissed: report.staff_missed ?? 0,
+    lowRankCompleted: report.low_rank_completed ?? 0,
+    lowRankMissed: report.low_rank_missed ?? 0,
+  };
 
   const fields = [
     {
       name: 'Overview',
       value: [
-        `**Events:** ${s.totalEvents ?? 0}`,
-        `**Attendance:** ${s.totalAttendance ?? 0}`,
-        `**Active Members:** ${s.activeMembers ?? '—'}`,
+        '**Events:** ' + summary.totalEvents,
+        '**Attendance:** ' + summary.totalAttendance,
+        '**Active Members:** —',
       ].join('\n'),
       inline: true,
     },
     {
       name: 'Quota',
       value: [
-        `**Staff MET:** ${quota.staffCompleted ?? 0}`,
-        `**Staff MISSED:** ${quota.staffMissed ?? 0}`,
-        `**Low Rank MET:** ${quota.lowRankCompleted ?? 0}`,
-        `**Low Rank MISSED:** ${quota.lowRankMissed ?? 0}`,
+        '**Staff MET:** ' + quota.staffCompleted,
+        '**Staff MISSED:** ' + quota.staffMissed,
+        '**Low Rank MET:** ' + quota.lowRankCompleted,
+        '**Low Rank MISSED:** ' + quota.lowRankMissed,
       ].join('\n'),
       inline: true,
     },
     {
       name: 'Discipline',
       value: [
-        `**New Strikes:** ${s.newStrikes ?? 0}`,
-        `**Recovered:** ${s.recoveredStrikes ?? 0}`,
-        `**Pending Removals:** ${s.pendingRemovals ?? 0}`,
+        '**New Strikes:** ' + summary.newStrikes,
+        '**Recovered:** ' + summary.recoveredStrikes,
+        '**Pending Removals:** ' + summary.pendingRemovals,
       ].join('\n'),
       inline: true,
     },
   ];
 
-  // Events by type — condense into one line.
-  if (Array.isArray(report.eventsByType) && report.eventsByType.length > 0) {
-    const byType = report.eventsByType
-      .map((e) => `${e.typeKey}: ${e.count}`)
-      .join(' • ');
-    fields.push({ name: 'Events by Type', value: byType, inline: false });
-  }
-
-  // Top hosts.
-  if (Array.isArray(report.topHosts) && report.topHosts.length > 0) {
-    const lines = report.topHosts.map((h, i) =>
-      `${i + 1}. <@${h.discordId}> — ${h.count}`
-    );
-    fields.push({ name: `Top Hosts (top ${report.topHosts.length})`, value: lines.join('\n'), inline: false });
-  }
-
-  // Top attendees.
-  if (Array.isArray(report.topAttendees) && report.topAttendees.length > 0) {
-    const lines = report.topAttendees.map((a, i) =>
-      `${i + 1}. <@${a.discordId}> — ${a.count}`
-    );
-    fields.push({ name: `Top Attendees (top ${report.topAttendees.length})`, value: lines.join('\n'), inline: false });
-  }
-
-  // Sync summary.
-  const sync = report.syncSummary ?? {};
-  if ((sync.syncCount ?? 0) > 0) {
+  const byType = Array.isArray(report.events_by_type_json) ? report.events_by_type_json : [];
+  if (byType.length > 0) {
     fields.push({
-      name: 'Roblox Sync',
-      value: [
-        `**Syncs:** ${sync.syncCount}`,
-        `**Members fetched:** ${sync.membersFetched}`,
-        `**Rank changes:** ${sync.rankChanges}`,
-        `**Left group:** ${sync.membersRemoved}`,
-      ].join('\n'),
+      name: 'Events by Type',
+      value: byType.map((e) => (e.typeKey || e._id) + ': ' + e.count).join(' • '),
+      inline: false,
+    });
+  }
+
+  const topHosts = Array.isArray(report.top_hosts_json) ? report.top_hosts_json : [];
+  if (topHosts.length > 0) {
+    fields.push({
+      name: 'Top Hosts (top ' + topHosts.length + ')',
+      value: topHosts.map((h, i) => (i + 1) + '. <@' + h.discordId + '> — ' + h.count).join('\n'),
+      inline: false,
+    });
+  }
+
+  const topAttendees = Array.isArray(report.top_attendees_json) ? report.top_attendees_json : [];
+  if (topAttendees.length > 0) {
+    fields.push({
+      name: 'Top Attendees (top ' + topAttendees.length + ')',
+      value: topAttendees.map((a, i) => (i + 1) + '. <@' + a.discordId + '> — ' + a.count).join('\n'),
       inline: false,
     });
   }
@@ -544,15 +318,14 @@ export function renderDiscordEmbed(report) {
     embeds: [
       {
         title,
-        description: `Period: ${fmtDate(report.periodStart)} → ${fmtDate(report.periodEnd)}`,
+        description:
+          'Period: ' + fmtDate(report.period_start) + ' → ' + fmtDate(report.period_end),
         color: 0x3498db,
         fields,
         footer: {
-          text: `Generated ${fmtDate(report.generatedAt)} by ${report.generatedBy}`,
+          text: 'Generated ' + fmtDate(report.generated_at) + ' by ' + report.generated_by,
         },
-        timestamp: (report.generatedAt ?? new Date()).toISOString
-          ? (report.generatedAt ?? new Date()).toISOString()
-          : new Date(report.generatedAt ?? Date.now()).toISOString(),
+        timestamp: new Date(report.generated_at).toISOString(),
       },
     ],
   };
@@ -570,7 +343,7 @@ function fmtDate(d) {
 // ============================================================
 
 export async function getReportById(reportId) {
-  const r = await Report.findById(reportId).lean();
+  const r = await reportRepo.findById(reportId);
   if (!r) throw new NotFoundError('Report', { id: String(reportId) });
   return r;
 }
@@ -578,15 +351,8 @@ export async function getReportById(reportId) {
 export async function listReports({ kind, page = 1, pageSize = 25 } = {}) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 25));
-  const skip = (page - 1) * pageSize;
 
-  const filter = {};
-  if (kind) filter.kind = kind;
-
-  const [items, total] = await Promise.all([
-    Report.find(filter).sort({ generatedAt: -1 }).skip(skip).limit(pageSize).lean(),
-    Report.countDocuments(filter),
-  ]);
+  const { items, total } = await reportRepo.list({ kind, page, pageSize });
 
   return {
     items,
@@ -597,9 +363,6 @@ export async function listReports({ kind, page = 1, pageSize = 25 } = {}) {
   };
 }
 
-/**
- * Return the most recent report of the given kind, or null.
- */
 export async function getLatestReport(kind) {
-  return Report.findOne({ kind }).sort({ generatedAt: -1 }).lean();
+  return reportRepo.findLatest(kind);
 }

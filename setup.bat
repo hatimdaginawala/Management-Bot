@@ -623,7 +623,7 @@ echo Writing src/routes/health.routes.js...
 (
 echo import { Router } from 'express';
 echo import { asyncHandler } from '../utils/asyncHandler.js';
-echo import { isDatabaseHealthy } from '../config/database.js';
+echo import { isDatabaseHealthy } from '../db/client.js';
 echo import { APP_NAME, APP_VERSION } from '../config/constants.js';
 echo.
 echo const router = Router^(^);

@@ -7,14 +7,18 @@
   "engines": {
     "node": ">=18.0.0"
   },
-"scripts": {
-  "start": "node src/server.js",
-  "dev": "node src/server.js",
-  "deploy:commands": "node src/bot/deployCommands.js",
-  "seed": "node scripts/seedAll.js",
-  "test": "set NODE_OPTIONS=--experimental-vm-modules&& node node_modules/jest/bin/jest.js",
-  "lint": "echo lint-not-configured"
-},
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "deploy:commands": "node src/bot/deployCommands.js",
+    "seed": "node scripts/seedAll.js",
+    "test": "set NODE_ENV=test&& node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "lint": "echo lint-not-configured",
+    "db:migrate": "knex --knexfile knexfile.js migrate:latest",
+    "db:rollback": "knex --knexfile knexfile.js migrate:rollback",
+    "db:status": "knex --knexfile knexfile.js migrate:list",
+    "db:seed": "knex --knexfile knexfile.js seed:run"
+  },
   "dependencies": {
     "axios": "^1.7.7",
     "cors": "^2.8.5",
@@ -23,14 +27,15 @@
     "express": "^4.21.0",
     "express-rate-limit": "^7.4.0",
     "helmet": "^8.0.0",
+    "knex": "^3.1.0",
     "mongoose": "^8.24.5",
+    "mysql2": "^3.11.3",
     "node-cron": "^3.0.3",
     "pino": "^9.4.0",
     "pino-http": "^10.3.0"
   },
   "devDependencies": {
     "jest": "^29.7.0",
-    "mongodb-memory-server": "^10.0.0",
     "pino-pretty": "^11.2.2"
   }
 }

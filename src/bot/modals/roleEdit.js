@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as roleService from '../../services/role.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import * as sessions from '../sessions.js';
 import { renderCategoryPicker } from './roleCreate.js';
@@ -13,9 +13,9 @@ export async function execute(interaction) {
   const key = interaction.customId.split(':')[2];
   if (!key) throw new ValidationError('Missing role key in interaction.');
 
-  const actor = await User.findOne({ discordId: interaction.user.id });
+  const actor = await userRepo.findByDiscordId(interaction.user.id);
   if (!actor) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(actor._id, 'roles.edit');
+  const ok = await permissionService.hasPermission(actor.id, 'roles.edit');
   if (!ok) throw new AuthorizationError('You do not have permission to edit roles.');
 
   const existingRole = await roleService.getRoleByKey(key);
@@ -41,14 +41,13 @@ export async function execute(interaction) {
     patch.quotaCategory = quotaRaw;
   }
 
-  // Start the edit flow with the existing role state.
   sessions.startSession('role:edit-flow', interaction.user.id, {
     key: existingRole.key,
     name: patch.name || existingRole.name,
     description: patch.description || existingRole.description,
     priority: patch.priority ?? existingRole.priority,
-    quotaCategory: patch.quotaCategory || existingRole.quotaCategory,
-    permissions: existingRole.permissions.slice(),
+    quotaCategory: patch.quotaCategory || existingRole.quota_category,
+    permissions: (existingRole.permissions || []).slice(),
     isEdit: true,
   });
 

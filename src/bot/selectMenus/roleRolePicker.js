@@ -1,7 +1,6 @@
-import { MessageFlags } from 'discord.js';
 import * as roleService from '../../services/role.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { successEmbed, errorEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
@@ -10,21 +9,18 @@ export const customId = ['role:assign:role', 'role:remove:role'];
 export const meta = {};
 
 export async function execute(interaction) {
-  const kind = interaction.customId.split(':')[1]; // assign | remove
+  const kind = interaction.customId.split(':')[1];
   const roleKey = interaction.values[0];
 
-  const actor = await User.findOne({ discordId: interaction.user.id });
+  const actor = await userRepo.findByDiscordId(interaction.user.id);
   if (!actor) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(actor._id, 'roles.assign');
+  const ok = await permissionService.hasPermission(actor.id, 'roles.assign');
   if (!ok) throw new AuthorizationError('You do not have permission to assign roles.');
 
   const session = sessions.getSession('role:' + kind, interaction.user.id);
   if (!session || !session.userId) {
     return interaction.update({
-      embeds: [errorEmbed({
-        title: 'Session Expired',
-        description: 'Please run `/roles ' + kind + '` again.',
-      })],
+      embeds: [errorEmbed({ title: 'Session Expired', description: 'Please run `/roles ' + kind + '` again.' })],
       components: [],
     });
   }

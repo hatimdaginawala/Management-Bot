@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as leaveService from '../../services/leave.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { successEmbed, errorEmbed, COLORS } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
@@ -11,9 +11,9 @@ export const customId = 'modal:leave-end';
 export const meta = {};
 
 export async function execute(interaction) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'leave.manage');
+  const ok = await permissionService.hasPermission(user.id, 'leave.manage');
   if (!ok) throw new AuthorizationError('You do not have permission to end leaves.');
 
   const session = sessions.getSession('leave:end', interaction.user.id);
@@ -31,8 +31,7 @@ export async function execute(interaction) {
   const result = await leaveService.endLeave(interaction.user.id, session.leaveId, { reason });
   sessions.clearSession('leave:end', interaction.user.id);
 
-  // DM the user if the leave was actually ended.
-  if (result.ended && result.leave?.discordId) {
+  if (result.ended && result.leave?.discord_id) {
     await dmLeaveUser(interaction.client, result.leave, {
       title: 'Leave Ended',
       color: COLORS.WARNING,
@@ -46,8 +45,8 @@ export async function execute(interaction) {
   return interaction.editReply({
     embeds: [successEmbed({
       title: result.ended ? 'Leave Ended' : 'Already Ended',
-      description: result.ended && result.leave?.discordId
-        ? 'Leave for <@' + result.leave.discordId + '> has been ended early.'
+      description: result.ended && result.leave?.discord_id
+        ? 'Leave for <@' + result.leave.discord_id + '> has been ended early.'
         : 'This leave is no longer active.',
       ...(reason ? { fields: [{ name: 'Reason', value: reason, inline: false }] } : {}),
     })],

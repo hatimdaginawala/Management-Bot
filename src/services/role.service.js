@@ -1,5 +1,6 @@
-import { Role, RoleAssignment, User } from '../models/index.js';
-import { Permission } from '../models/index.js';
+import * as roleRepo from '../db/repositories/role.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as roleAssignmentRepo from '../db/repositories/roleAssignment.repository.js';
 import { audit } from '../utils/audit.js';
 import {
   ConflictError,
@@ -9,45 +10,35 @@ import {
 } from '../utils/errors.js';
 import {
   assertCanManageRoleByDiscordId,
-  getHighestPriority,            // for target user (ObjectId)
-  getHighestPriorityByDiscordId, // for actor (Discord ID)
+  getHighestPriority,
+  getHighestPriorityByDiscordId,
 } from './permission.service.js';
 import logger from '../config/logger.js';
 
 /**
- * Role service.
- * Every mutating operation writes an audit entry.
- * Every operation that touches an existing role enforces
- * priority via `assertCanManageRoleByDiscordId`.
+ * Role service. Public API is unchanged from the Mongoose version.
  */
 
 // ---------- Reads ----------
 
 export async function listRoles({ includeInactive = false } = {}) {
-  const filter = includeInactive ? {} : { active: true };
-  return Role.find(filter).sort({ priority: -1, name: 1 }).lean();
+  return roleRepo.list({ includeInactive });
 }
 
 export async function getRoleByKey(key) {
-  const role = await Role.findOne({ key: key.toLowerCase() }).lean();
+  const role = await roleRepo.findByKey(key);
   if (!role) throw new NotFoundError('Role', { key });
   return role;
 }
 
 export async function getRoleById(id) {
-  const role = await Role.findById(id).lean();
+  const role = await roleRepo.findById(id);
   if (!role) throw new NotFoundError('Role', { id: String(id) });
   return role;
 }
 
 // ---------- Creates ----------
 
-/**
- * Create a new custom role.
- * - key must be unique
- * - priority must be strictly LESS THAN the actor's own highest priority
- *   (you cannot create a role above your own level)
- */
 export async function createRole(actorId, payload) {
   const {
     key,
@@ -70,27 +61,23 @@ export async function createRole(actorId, payload) {
     throw new ValidationError('Priority must be a number between 0 and 999.');
   }
   if (!['NONE', 'STAFF', 'LOW_RANK'].includes(quotaCategory)) {
-    throw new ValidationError(
-      'quotaCategory must be one of NONE, STAFF, LOW_RANK.'
-    );
+    throw new ValidationError('quotaCategory must be one of NONE, STAFF, LOW_RANK.');
   }
 
-  // Actor must outrank the role they're creating.
   const { priority: actorPriority, role: actorTop } =
     await getHighestPriorityByDiscordId(actorId);
-  if (actorTop?.isPermanent !== true && priority >= actorPriority) {
+  if (actorTop?.is_permanent !== true && priority >= actorPriority) {
     throw new AuthorizationError(
       'You cannot create a role with priority ≥ your own highest role.'
     );
   }
 
-  // Validate permissions against the catalog (wildcards allowed).
   validatePermissionsShape(permissions);
 
-  const existing = await Role.findOne({ key: key.toLowerCase() });
-  if (existing) throw new ConflictError(`Role key "${key}" already exists.`);
+  const existing = await roleRepo.findByKey(key);
+  if (existing) throw new ConflictError('Role key "' + key + '" already exists.');
 
-  const role = await Role.create({
+  const role = await roleRepo.create({
     key: key.toLowerCase(),
     name,
     description,
@@ -110,8 +97,8 @@ export async function createRole(actorId, payload) {
     action: 'role.created',
     category: 'ROLE',
     targetType: 'Role',
-    targetId: role._id,
-    after: role.toObject(),
+    targetId: role.id,
+    after: role,
   });
 
   logger.info({ actorId, roleKey: role.key }, 'Role created');
@@ -120,22 +107,16 @@ export async function createRole(actorId, payload) {
 
 // ---------- Updates ----------
 
-/**
- * Edit an existing role.
- * System roles can be edited (per §51) EXCEPT `isEditable: false` roles
- * (only super_admin).
- * Priority may not be raised to ≥ the actor's own priority.
- */
 export async function editRole(actorId, key, patch) {
-  const role = await Role.findOne({ key: key.toLowerCase() });
+  const role = await roleRepo.findByKey(key);
   if (!role) throw new NotFoundError('Role', { key });
 
-  if (!role.isEditable) {
-    throw new AuthorizationError(`Role "${role.key}" is not editable.`);
+  if (!role.is_editable) {
+    throw new AuthorizationError('Role "' + role.key + '" is not editable.');
   }
   await assertCanManageRoleByDiscordId(actorId, role);
 
-  const before = role.toObject();
+  const before = { ...role };
   const updates = {};
 
   if (patch.name !== undefined) {
@@ -160,7 +141,7 @@ export async function editRole(actorId, key, patch) {
     }
     const { priority: actorPriority, role: actorTop } =
       await getHighestPriorityByDiscordId(actorId);
-    if (actorTop?.isPermanent !== true && patch.priority >= actorPriority) {
+    if (actorTop?.is_permanent !== true && patch.priority >= actorPriority) {
       throw new AuthorizationError(
         'You cannot set a role priority ≥ your own highest role.'
       );
@@ -169,14 +150,12 @@ export async function editRole(actorId, key, patch) {
   }
   if (patch.quotaCategory !== undefined) {
     if (!['NONE', 'STAFF', 'LOW_RANK'].includes(patch.quotaCategory)) {
-      throw new ValidationError(
-        'quotaCategory must be one of NONE, STAFF, LOW_RANK.'
-      );
+      throw new ValidationError('quotaCategory must be one of NONE, STAFF, LOW_RANK.');
     }
     updates.quotaCategory = patch.quotaCategory;
   }
   if (patch.active !== undefined) {
-    if (role.isPermanent) {
+    if (role.is_permanent) {
       throw new AuthorizationError('Permanent roles cannot be deactivated.');
     }
     updates.active = Boolean(patch.active);
@@ -184,67 +163,59 @@ export async function editRole(actorId, key, patch) {
 
   if (Object.keys(updates).length === 0) return role;
 
-  Object.assign(role, updates);
-  await role.save();
+  const updated = await roleRepo.updateById(role.id, updates);
 
   await audit({
     actorId,
     action: 'role.edited',
     category: 'ROLE',
     targetType: 'Role',
-    targetId: role._id,
+    targetId: role.id,
     before,
-    after: role.toObject(),
+    after: updated,
   });
 
-  // If quotaCategory changed, users holding this role may need their
-  // cached User.quota.category recomputed. Phase 3 does not do this
-  // automatically — a follow-up call to user.service.recomputeQuotaCategory
-  // is issued by the caller (the command handler).
-  if (updates.quotaCategory && updates.quotaCategory !== before.quotaCategory) {
+  if (
+    updates.quotaCategory !== undefined &&
+    updates.quotaCategory !== before.quota_category
+  ) {
     logger.info(
-      { roleKey: role.key, from: before.quotaCategory, to: updates.quotaCategory },
+      { roleKey: role.key, from: before.quota_category, to: updates.quotaCategory },
       'quotaCategory changed — caller should recompute affected users'
     );
   }
 
-  return role;
+  return updated;
 }
 
 // ---------- Deletes ----------
 
-/**
- * Delete a role. Only `isDeletable: true` roles may be deleted.
- * Refuses to delete a role that still has ACTIVE assignments.
- */
 export async function deleteRole(actorId, key) {
-  const role = await Role.findOne({ key: key.toLowerCase() });
+  const role = await roleRepo.findByKey(key);
   if (!role) throw new NotFoundError('Role', { key });
 
-  if (!role.isDeletable) {
-    throw new AuthorizationError(`Role "${role.key}" is protected and cannot be deleted.`);
+  if (!role.is_deletable) {
+    throw new AuthorizationError('Role "' + role.key + '" is protected and cannot be deleted.');
   }
   await assertCanManageRoleByDiscordId(actorId, role);
 
-  const activeCount = await RoleAssignment.countDocuments({
-    role: role._id,
-    active: true,
-  });
+  const activeCount = await roleRepo.countActiveAssignments(role.id);
   if (activeCount > 0) {
     throw new ConflictError(
-      `Cannot delete role "${role.key}" — ${activeCount} active assignment(s) exist. Remove them first.`
+      'Cannot delete role "' + role.key + '" — ' + activeCount +
+      ' active assignment(s) exist. Remove them first.'
     );
   }
 
-  const before = role.toObject();
-  await role.deleteOne();
+  const before = { ...role };
+  await roleRepo.deleteById(role.id);
 
   await audit({
     actorId,
     action: 'role.deleted',
     category: 'ROLE',
     targetType: 'Role',
-    targetId: before._id,
+    targetId: before.id,
     before,
   });
 
@@ -253,32 +224,24 @@ export async function deleteRole(actorId, key) {
 
 // ---------- Assignment ----------
 
-/**
- * Assign a role to a user by discordId.
- * Enforces:
- *   - actor can manage the role
- *   - actor can manage the target user's current highest role (i.e.
- *     cannot assign a role to someone who outranks them)
- *   - idempotent: re-assigning an active role is a no-op
- */
 export async function assignRole(actorId, discordId, roleKey, { reason = null } = {}) {
   const [user, role] = await Promise.all([
-    User.findOne({ discordId }),
-    Role.findOne({ key: roleKey.toLowerCase(), active: true }),
+    userRepo.findByDiscordId(discordId),
+    roleRepo.findByKey(roleKey),
   ]);
   if (!user) throw new NotFoundError('User', { discordId });
-  if (!role) throw new NotFoundError('Role', { key: roleKey });
+  if (!role || !role.active) throw new NotFoundError('Role', { key: roleKey });
 
   await assertCanManageRoleByDiscordId(actorId, role);
 
   // Actor must also outrank the target's current highest role.
   const { priority: targetPriority, role: targetTop } =
-    await getHighestPriority(user._id);
-  if (targetTop && targetTop.isPermanent !== true) {
+    await getHighestPriority(user.id);
+  if (targetTop && targetTop.is_permanent !== true) {
     const { priority: actorPriority, role: actorTop } =
       await getHighestPriorityByDiscordId(actorId);
     if (
-      actorTop?.isPermanent !== true &&
+      actorTop?.is_permanent !== true &&
       actorPriority <= targetPriority &&
       actorId !== discordId
     ) {
@@ -288,65 +251,28 @@ export async function assignRole(actorId, discordId, roleKey, { reason = null } 
     }
   }
 
-  // Idempotent activation:
-  //   1. Try reactivating a previously removed assignment.
-  //   2. If none exists, create a new one.
-  //   3. Catch unique-index conflicts as no-ops.
-  const existingActive = await RoleAssignment.findOne({
-    user: user._id,
-    role: role._id,
-    active: true,
-  });
+  // Idempotent check + reactivate-or-insert.
+  const existingActive = await roleAssignmentRepo.findActiveByUserAndRole(user.id, role.id);
   if (existingActive) {
-    logger.debug(
-      { discordId, roleKey: role.key },
-      'Role already assigned — no-op'
-    );
+    logger.debug({ discordId, roleKey: role.key }, 'Role already assigned — no-op');
     return { assigned: false, role: role.key, discordId };
   }
 
-  const reactivated = await RoleAssignment.findOneAndUpdate(
-    { user: user._id, role: role._id, active: false },
-    {
-      $set: {
-        active: true,
-        assignedBy: actorId,
-        assignedAt: new Date(),
-        removedAt: null,
-        removedBy: null,
-        reason,
-      },
-    },
-    { new: true }
-  );
-
-  if (!reactivated) {
-    try {
-      await RoleAssignment.create({
-        user: user._id,
-        discordId: user.discordId,
-        role: role._id,
-        roleKey: role.key,
-        assignedBy: actorId,
-        reason,
-        active: true,
-      });
-    } catch (err) {
-      if (err.code === 11000) {
-        // Concurrent assign raced us; treat as no-op.
-        logger.debug({ discordId, roleKey: role.key }, 'Concurrent assign — no-op');
-        return { assigned: false, role: role.key, discordId };
-      }
-      throw err;
-    }
-  }
+  await roleAssignmentRepo.ensureActive({
+    userId: user.id,
+    discordId: user.discord_id,
+    roleId: role.id,
+    roleKey: role.key,
+    assignedBy: actorId,
+    reason,
+  });
 
   await audit({
     actorId,
     action: 'role.assigned',
     category: 'ROLE',
     targetType: 'User',
-    targetId: user._id,
+    targetId: user.id,
     after: { discordId, roleKey: role.key },
     reason,
   });
@@ -354,41 +280,31 @@ export async function assignRole(actorId, discordId, roleKey, { reason = null } 
   return { assigned: true, role: role.key, discordId };
 }
 
-/**
- * Remove a role from a user. Soft-delete (active: false).
- * Idempotent: removing a role that isn't assigned is a no-op.
- */
 export async function removeRole(actorId, discordId, roleKey, { reason = null } = {}) {
   const [user, role] = await Promise.all([
-    User.findOne({ discordId }),
-    Role.findOne({ key: roleKey.toLowerCase() }),
+    userRepo.findByDiscordId(discordId),
+    roleRepo.findByKey(roleKey),
   ]);
   if (!user) throw new NotFoundError('User', { discordId });
   if (!role) throw new NotFoundError('Role', { key: roleKey });
 
   await assertCanManageRoleByDiscordId(actorId, role);
 
-  const assignment = await RoleAssignment.findOne({
-    user: user._id,
-    role: role._id,
-    active: true,
+  const removed = await roleAssignmentRepo.deactivate(user.id, role.id, {
+    removedBy: actorId,
+    reason,
   });
-  if (!assignment) {
+
+  if (removed === 0) {
     return { removed: false, role: role.key, discordId };
   }
-
-  assignment.active = false;
-  assignment.removedAt = new Date();
-  assignment.removedBy = actorId;
-  assignment.reason = reason ?? assignment.reason;
-  await assignment.save();
 
   await audit({
     actorId,
     action: 'role.removed',
     category: 'ROLE',
     targetType: 'User',
-    targetId: user._id,
+    targetId: user.id,
     before: { discordId, roleKey: role.key },
     reason,
   });
@@ -398,25 +314,16 @@ export async function removeRole(actorId, discordId, roleKey, { reason = null } 
 
 // ---------- Helpers ----------
 
-/**
- * Validate permission strings. Wildcards allowed.
- * Rejects anything that is not a string, is empty, or is too long.
- * Does NOT require the permission to exist in the catalog — an
- * unrecognized permission grants nothing at resolve time (see
- * permission.service.expandPermission), so storing it is harmless.
- */
 function validatePermissionsShape(permissions) {
   if (!Array.isArray(permissions)) {
     throw new ValidationError('Permissions must be an array of strings.');
   }
   for (const p of permissions) {
     if (typeof p !== 'string' || p.length === 0 || p.length > 60) {
-      throw new ValidationError(
-        `Invalid permission entry: ${JSON.stringify(p)}`
-      );
+      throw new ValidationError('Invalid permission entry: ' + JSON.stringify(p));
     }
     if (!/^(\*|[a-z][a-z0-9_]*(\.[a-z0-9_]+|\.[a-z0-9_*]+)?)$/.test(p)) {
-      throw new ValidationError(`Permission has invalid format: ${p}`);
+      throw new ValidationError('Permission has invalid format: ' + p);
     }
   }
 }

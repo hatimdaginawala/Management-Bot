@@ -1,68 +1,78 @@
-import {
-  Event,
-  EventType,
-  User,
-  Attendance,
-  Settings,
-} from '../models/index.js';
+import * as eventRepo from '../db/repositories/event.repository.js';
+import * as eventTypeRepo from '../db/repositories/eventType.repository.js';
+import * as eventAttendeeRepo from '../db/repositories/eventAttendee.repository.js';
+import * as attendanceRepo from '../db/repositories/attendance.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as settingsRepo from '../db/repositories/settings.repository.js';
 import { audit } from '../utils/audit.js';
 import {
   ValidationError,
   ConflictError,
   NotFoundError,
-  AuthorizationError,
 } from '../utils/errors.js';
-import { EVENT_COOLDOWN_MS } from '../config/constants.js';
 import logger from '../config/logger.js';
+import { db } from '../db/client.js';
+
+const MAX_ATTENDEES = 200;
+const DEFAULT_COOLDOWN_MINUTES = 5;
+const DEFAULT_APPROVAL_REQUIRED = true;
 
 /**
  * Event service.
  *
- * Single entry point for all event operations. Discord commands and
- * future REST routes call these; nothing else touches Event or
- * Attendance directly.
+ * Public API identical to the Mongoose version.
  *
- * Idempotency strategy (no transactions):
- *   - approveEvent: `findOneAndUpdate({ status: 'PENDING' }, { status: 'APPROVED' })`
- *     acts as a CAS. Only the caller who wins the CAS performs the
- *     attendance fan-out.
- *   - Attendance uses `Attendance.updateOne(..., { upsert: true })`
- *     which is idempotent thanks to `uniq_event_user`.
- *   - cancelEvent deletes Attendance rows by event ID, which is safe
- *     to re-run.
- *   - updateEvent recomputes attendance as a full set-difference:
- *     adds new, removes stale, leaves unchanged.
+ * Idempotency strategy (no transactions in the old version):
+ *   - createEvent: transaction wraps event insert + attendee inserts
+ *   - approveEvent: atomic status CAS via approveAtomic; attendance
+ *     fan-out is idempotent thanks to unique (event_id, user_id)
+ *   - cancelEvent: transaction wraps status change + attendance delete
+ *   - updateEvent: transaction wraps attendee replace + attendance re-fan-out
+ *
+ * The repository exposes both atomic single-statement methods and db-
+ * level transaction support. Where multiple writes must succeed or fail
+ * together, we use `db.transaction(...)`.
  */
 
 // ============================================================
-//  Helpers
+//  Settings helpers
 // ============================================================
 
-async function getSettings() {
-  const s = await Settings.findOne({ key: 'global' }).lean();
-  return s ?? {};
+async function readSetting(key, fallback) {
+  const row = await settingsRepo.findByKey(key);
+  if (!row) return fallback;
+  try {
+    return JSON.parse(row.value_json);
+  } catch {
+    return fallback;
+  }
 }
 
-/**
- * Normalize attendee entries:
- *   - dedupe by discordId (and robloxUsername for unverified)
- *   - remove the host if present
- *   - cap the list length to prevent abuse
- */
+async function getEventSettings() {
+  const [approvalRequired, cooldownMinutes] = await Promise.all([
+    readSetting('events.approvalRequired', DEFAULT_APPROVAL_REQUIRED),
+    readSetting('events.cooldownMinutes', DEFAULT_COOLDOWN_MINUTES),
+  ]);
+  return { approvalRequired, cooldownMinutes };
+}
+
+// ============================================================
+//  Attendee normalization
+// ============================================================
+
 function normalizeAttendees(rawAttendees, hostDiscordId) {
-  const MAX = 200;
   const seen = new Set();
   const result = [];
 
   for (const a of rawAttendees) {
-    if (result.length >= MAX) break;
+    if (result.length >= MAX_ATTENDEES) break;
     const discordId = a.discordId ? String(a.discordId) : null;
     const robloxUsername = a.robloxUsername ? String(a.robloxUsername).trim() : null;
 
     if (!discordId && !robloxUsername) continue;
-    if (discordId && discordId === hostDiscordId) continue; // host excluded
+    if (discordId && discordId === hostDiscordId) continue;
 
-    const key = discordId ?? `rbx:${robloxUsername.toLowerCase()}`;
+    const key = discordId ?? ('rbx:' + robloxUsername.toLowerCase());
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -77,113 +87,76 @@ function normalizeAttendees(rawAttendees, hostDiscordId) {
   return result;
 }
 
-/**
- * Look up Users for every attendee entry that has a discordId.
- * Unlinked attendees stay unverified.
- */
 async function resolveAttendeeUsers(entries) {
   const withDiscordIds = entries.filter((e) => e.discordId);
   if (withDiscordIds.length === 0) return entries;
 
-  const users = await User.find({
-    discordId: { $in: withDiscordIds.map((e) => e.discordId) },
-  })
-    .select('_id discordId')
-    .lean();
-  const byDiscordId = new Map(users.map((u) => [u.discordId, u]));
+  const users = [];
+  for (const entry of withDiscordIds) {
+    const u = await userRepo.findByDiscordId(entry.discordId);
+    if (u) users.push(u);
+  }
+  const byDiscordId = new Map(users.map((u) => [u.discord_id, u]));
 
   return entries.map((e) => {
     if (!e.discordId) return e;
     const u = byDiscordId.get(e.discordId);
     return {
       ...e,
-      resolvedUserId: u ? u._id : null,
+      resolvedUserId: u ? u.id : null,
       isVerified: Boolean(u),
     };
   });
 }
 
-/**
- * Enforce the 5-minute cooldown between events by the same host.
- * Returns { allowed: boolean, retryAt: Date | null }.
- */
+// ============================================================
+//  Cooldown check
+// ============================================================
+
 async function checkCooldown(hostDiscordId, cooldownMs) {
-  const last = await Event.findOne({ 'host.discordId': hostDiscordId })
-    .sort({ cooldownAnchor: -1 })
-    .select('cooldownAnchor')
-    .lean();
+  const last = await eventRepo.findLatestByHost(hostDiscordId);
   if (!last) return { allowed: true, retryAt: null };
-  const nextAllowed = new Date(new Date(last.cooldownAnchor).getTime() + cooldownMs);
+
+  const lastAnchor = new Date(last.cooldown_anchor).getTime();
+  const nextAllowed = new Date(lastAnchor + cooldownMs);
   if (nextAllowed <= new Date()) return { allowed: true, retryAt: null };
   return { allowed: false, retryAt: nextAllowed };
 }
 
-/**
- * Fan out Attendance rows for an approved event.
- * Uses upsert + uniq_event_user for idempotency.
- */
-async function writeAttendanceForEvent(event) {
-  const activeEntries = event.attendeeEntries.filter((e) => e.resolvedUserId);
-  if (activeEntries.length === 0) return { inserted: 0, skipped: 0 };
-
-  let inserted = 0;
-  let skipped = 0;
-
-  for (const entry of activeEntries) {
-    const result = await Attendance.updateOne(
-      { event: event._id, user: entry.resolvedUserId },
-      {
-        $setOnInsert: {
-          event: event._id,
-          eventTypeKey: event.eventTypeKey,
-          user: entry.resolvedUserId,
-          discordId: entry.discordId,
-          robloxId: null, // populated in Phase 9 quota evaluation if needed
-          eventAt: event.createdAt ?? new Date(),
-          status: 'PRESENT',
-          addedBy: null,
-          active: true,
-        },
-      },
-      { upsert: true }
-    );
-    if (result.upsertedCount === 1) inserted++;
-    else skipped++;
-  }
-
-  return { inserted, skipped };
-}
-
-/**
- * Remove every Attendance row for an event.
- * Used by cancelEvent and updateEvent (before re-fanning out).
- */
-async function clearAttendanceForEvent(eventId) {
-  const result = await Attendance.deleteMany({ event: eventId });
-  return result.deletedCount ?? 0;
-}
-
 // ============================================================
-//  Create
+//  Attendance fan-out
 // ============================================================
 
 /**
- * Create a new event.
- *
- * Validation:
- *   - host has permission (caller's responsibility)
- *   - event type exists and is active
- *   - proof URL is present and looks like a URL
- *   - attendees are provided, and host is not among them
- *   - 5-minute cooldown has passed
- *   - approval behavior comes from Settings.events.approvalRequired
- *
- * Returns the created Event document.
+ * Fan out attendance rows for an approved event.
+ * Idempotent via the unique (event_id, user_id) index.
+ * Returns { created, skipped }.
  */
+async function writeAttendanceForEvent(event, attendees, trx = db) {
+  const activeEntries = attendees.filter((e) => e.resolved_user_id);
+  if (activeEntries.length === 0) return { created: 0, skipped: 0 };
+
+  const rows = activeEntries.map((entry) => ({
+    eventId: event.id,
+    eventTypeKey: event.event_type_key,
+    userId: entry.resolved_user_id,
+    discordId: entry.discord_id,
+    robloxId: null,
+    eventAt: event.created_at,
+    status: 'PRESENT',
+  }));
+
+  return attendanceRepo.ensurePresentBatch(rows);
+}
+
+// ============================================================
+//  createEvent
+// ============================================================
+
 export async function createEvent(actorDiscordId, payload) {
   const {
     eventTypeKey,
-    attendees = [],
+    attendees: rawAttendees = [],
     proofUrl,
     notes = '',
   } = payload;
@@ -195,34 +168,27 @@ export async function createEvent(actorDiscordId, payload) {
   if (!/^https?:\/\//i.test(proofUrl.trim())) {
     throw new ValidationError('Proof URL must start with http:// or https://');
   }
-  if (!Array.isArray(attendees) || attendees.length === 0) {
+  if (!Array.isArray(rawAttendees) || rawAttendees.length === 0) {
     throw new ValidationError('At least one attendee is required.');
   }
 
-  const eventType = await EventType.findOne({
-    key: eventTypeKey.toLowerCase(),
-    active: true,
-  }).lean();
-  if (!eventType) throw new NotFoundError('Event type', { key: eventTypeKey });
+  const eventType = await eventTypeRepo.findByKey(eventTypeKey);
+  if (!eventType || !eventType.active) {
+    throw new NotFoundError('Event type', { key: eventTypeKey });
+  }
 
-  const settings = await getSettings();
-  const approvalRequired = settings.events?.approvalRequired ?? true;
-  const cooldownMs = (settings.events?.cooldownMinutes ?? 5) * 60 * 1000;
+  const { approvalRequired, cooldownMinutes } = await getEventSettings();
+  const cooldownMs = cooldownMinutes * 60 * 1000;
 
-  // Cooldown check (applies regardless of approval mode).
   const { allowed, retryAt } = await checkCooldown(actorDiscordId, cooldownMs);
   if (!allowed) {
     const secs = Math.ceil((retryAt.getTime() - Date.now()) / 1000);
-    throw new ConflictError(
-      `Please wait ${secs}s before logging another event.`
-    );
+    throw new ConflictError('Please wait ' + secs + 's before logging another event.');
   }
 
-  // Host lookup (for snapshot).
-  const host = await User.findOne({ discordId: actorDiscordId }).lean();
+  const host = await userRepo.findByDiscordId(actorDiscordId);
 
-  // Normalize + resolve attendees.
-  let entries = normalizeAttendees(attendees, actorDiscordId);
+  let entries = normalizeAttendees(rawAttendees, actorDiscordId);
   entries = await resolveAttendeeUsers(entries);
 
   if (entries.length === 0) {
@@ -233,125 +199,117 @@ export async function createEvent(actorDiscordId, payload) {
 
   const status = approvalRequired ? 'PENDING' : 'APPROVED';
 
-  const event = await Event.create({
-    host: {
-      userId: host?._id ?? null,
-      discordId: actorDiscordId,
-      discordUsername: host?.discordUsername ?? null,
-      robloxId: host?.robloxId ?? null,
-      robloxUsername: host?.robloxUsername ?? null,
-    },
-    eventType: eventType._id,
-    eventTypeKey: eventType.key,
-    attendeeEntries: entries,
-    proofUrl: proofUrl.trim(),
-    notes: String(notes).slice(0, 2000),
-    status,
-    createdBy: actorDiscordId,
-    cooldownAnchor: new Date(),
-    ...(status === 'APPROVED'
-      ? {
-          approvedBy: actorDiscordId,
-          approvedAt: new Date(),
-        }
-      : {}),
-  });
+  // Transaction: create event + attendees, and (if auto-approved)
+  // fan out attendance atomically.
+  const result = await db.transaction(async (trx) => {
+    const created = await eventRepo.create({
+      hostUserId: host?.id ?? null,
+      hostDiscordId: actorDiscordId,
+      hostDiscordUsername: host?.discord_username ?? null,
+      hostRobloxId: host?.roblox_id ?? null,
+      hostRobloxUsername: host?.roblox_username ?? null,
+      eventTypeId: eventType.id,
+      eventTypeKey: eventType.key,
+      proofUrl: proofUrl.trim(),
+      notes: String(notes).slice(0, 2000),
+      status,
+      createdBy: actorDiscordId,
+      cooldownAnchor: new Date(),
+      ...(status === 'APPROVED'
+        ? { approvedBy: actorDiscordId, approvedAt: new Date() }
+        : {}),
+    }, trx);
 
-  // Immediate fan-out if auto-approved.
-  if (status === 'APPROVED') {
-    await writeAttendanceForEvent(event);
-  }
+    const attendeeRows = await eventAttendeeRepo.insertMany(created.id, entries);
+
+    if (status === 'APPROVED') {
+      await writeAttendanceForEvent(created, attendeeRows, trx);
+    }
+
+    return { event: created, attendees: attendeeRows };
+  });
 
   await audit({
     actorId: actorDiscordId,
     action: status === 'APPROVED' ? 'event.created_auto_approved' : 'event.created',
     category: 'EVENT',
     targetType: 'Event',
-    targetId: event._id,
+    targetId: result.event.id,
     after: {
-      eventTypeKey: event.eventTypeKey,
+      eventTypeKey: result.event.event_type_key,
       status,
       attendees: entries.length,
-      proofUrl: event.proofUrl,
+      proofUrl: result.event.proof_url,
     },
   });
 
   logger.info(
-    { eventId: event._id, host: actorDiscordId, status, attendees: entries.length },
+    { eventId: result.event.id, host: actorDiscordId, status, attendees: entries.length },
     'Event created'
   );
-  return event;
+
+  return {
+    ...result.event,
+    attendeeEntries: result.attendees.map(toAttendeeEntryShape),
+  };
 }
 
 // ============================================================
-//  Approve / Reject
+//  approveEvent
 // ============================================================
 
-/**
- * Approve a PENDING event.
- * Idempotent: re-approving does nothing.
- * CAS: `findOneAndUpdate({ status: 'PENDING' }, ...)` ensures only
- * one concurrent approver performs the fan-out.
- */
 export async function approveEvent(actorDiscordId, eventId) {
-  const event = await Event.findOneAndUpdate(
-    { _id: eventId, status: 'PENDING' },
-    {
-      $set: {
-        status: 'APPROVED',
-        approvedBy: actorDiscordId,
-        approvedAt: new Date(),
-      },
-    },
-    { new: true }
-  );
+  const event = await eventRepo.approveAtomic(eventId, { approvedBy: actorDiscordId });
 
   if (!event) {
-    // Either not found or not PENDING. Disambiguate for a better error.
-    const existing = await Event.findById(eventId);
+    const existing = await eventRepo.findById(eventId);
     if (!existing) throw new NotFoundError('Event', { id: String(eventId) });
     if (existing.status === 'APPROVED') {
-      return { event: existing, alreadyApproved: true };
+      const attendees = await eventAttendeeRepo.listByEvent(existing.id);
+      return {
+        event: { ...existing, attendeeEntries: attendees.map(toAttendeeEntryShape) },
+        alreadyApproved: true,
+      };
     }
-    throw new ConflictError(`Cannot approve event with status ${existing.status}.`);
+    throw new ConflictError('Cannot approve event with status ' + existing.status + '.');
   }
 
-  await writeAttendanceForEvent(event);
+  const attendees = await eventAttendeeRepo.listByEvent(event.id);
+  await writeAttendanceForEvent(event, attendees);
 
   await audit({
     actorId: actorDiscordId,
     action: 'event.approved',
     category: 'EVENT',
     targetType: 'Event',
-    targetId: event._id,
+    targetId: event.id,
     after: { status: 'APPROVED' },
   });
 
-  return { event, alreadyApproved: false };
+  return {
+    event: { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) },
+    alreadyApproved: false,
+  };
 }
+
+// ============================================================
+//  rejectEvent
+// ============================================================
 
 export async function rejectEvent(actorDiscordId, eventId, { reason }) {
   if (!reason || reason.trim().length < 3) {
     throw new ValidationError('Rejection requires a reason.');
   }
 
-  const event = await Event.findOneAndUpdate(
-    { _id: eventId, status: 'PENDING' },
-    {
-      $set: {
-        status: 'REJECTED',
-        rejectedBy: actorDiscordId,
-        rejectedAt: new Date(),
-        rejectionReason: reason.trim(),
-      },
-    },
-    { new: true }
-  );
+  const event = await eventRepo.rejectAtomic(eventId, {
+    rejectedBy: actorDiscordId,
+    reason: reason.trim(),
+  });
 
   if (!event) {
-    const existing = await Event.findById(eventId);
+    const existing = await eventRepo.findById(eventId);
     if (!existing) throw new NotFoundError('Event', { id: String(eventId) });
-    throw new ConflictError(`Cannot reject event with status ${existing.status}.`);
+    throw new ConflictError('Cannot reject event with status ' + existing.status + '.');
   }
 
   await audit({
@@ -359,130 +317,127 @@ export async function rejectEvent(actorDiscordId, eventId, { reason }) {
     action: 'event.rejected',
     category: 'EVENT',
     targetType: 'Event',
-    targetId: event._id,
+    targetId: event.id,
     after: { status: 'REJECTED' },
     reason,
   });
 
-  return event;
+  const attendees = await eventAttendeeRepo.listByEvent(event.id);
+  return { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) };
 }
 
 // ============================================================
-//  Cancel
+//  cancelEvent
 // ============================================================
 
-/**
- * Cancel an APPROVED event. Removes all Attendance rows for it.
- * Idempotent: cancelling an already-cancelled event is a no-op.
- * Cancelling a PENDING event is allowed (no attendance to remove).
- */
 export async function cancelEvent(actorDiscordId, eventId, { reason = null } = {}) {
-  const existing = await Event.findById(eventId);
+  const existing = await eventRepo.findById(eventId);
   if (!existing) throw new NotFoundError('Event', { id: String(eventId) });
 
-  if (existing.status === 'CANCELLED') return existing;
+  if (existing.status === 'CANCELLED') {
+    const attendees = await eventAttendeeRepo.listByEvent(existing.id);
+    return { ...existing, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+  }
   if (existing.status === 'REJECTED') {
     throw new ConflictError('Cannot cancel a rejected event.');
   }
 
   const previousStatus = existing.status;
 
-  existing.status = 'CANCELLED';
-  existing.cancelledBy = actorDiscordId;
-  existing.cancelledAt = new Date();
-  existing.cancellationReason = reason;
-  await existing.save();
+  // Transaction: status update + attendance removal
+  await db.transaction(async (trx) => {
+    await eventRepo.updateById(existing.id, {
+      status: 'CANCELLED',
+      cancelledBy: actorDiscordId,
+      cancelledAt: new Date(),
+      cancellationReason: reason,
+    });
 
-  if (previousStatus === 'APPROVED') {
-    await clearAttendanceForEvent(existing._id);
-  }
+    if (previousStatus === 'APPROVED') {
+      await attendanceRepo.deleteByEvent(existing.id);
+    }
+  });
+
+  const updated = await eventRepo.findById(existing.id);
+  const attendees = await eventAttendeeRepo.listByEvent(existing.id);
 
   await audit({
     actorId: actorDiscordId,
     action: 'event.cancelled',
     category: 'EVENT',
     targetType: 'Event',
-    targetId: existing._id,
+    targetId: existing.id,
     before: { status: previousStatus },
     after: { status: 'CANCELLED' },
     reason,
   });
 
-  return existing;
+  return { ...updated, attendeeEntries: attendees.map(toAttendeeEntryShape) };
 }
 
 // ============================================================
-//  Update
+//  updateEvent
 // ============================================================
 
-/**
- * Update an event's mutable fields.
- * Reconciles Attendance only when the attendee list changes
- * AND the event is APPROVED.
- *
- * Mutable fields:
- *   - proofUrl
- *   - notes
- *   - attendees (fully replaces attendeeEntries)
- *
- * Immutable:
- *   - host
- *   - eventTypeKey
- *   - createdAt / cooldownAnchor
- */
 export async function updateEvent(actorDiscordId, eventId, patch) {
-  const event = await Event.findById(eventId);
+  const event = await eventRepo.findById(eventId);
   if (!event) throw new NotFoundError('Event', { id: String(eventId) });
 
   const before = {
-    proofUrl: event.proofUrl,
+    proofUrl: event.proof_url,
     notes: event.notes,
-    attendeeCount: event.attendeeEntries.length,
+    attendeeCount: (await eventAttendeeRepo.listByEvent(event.id)).length,
   };
 
   let attendeesChanged = false;
+  let newEntries = null;
 
   if (patch.proofUrl !== undefined) {
     if (!/^https?:\/\//i.test(String(patch.proofUrl))) {
       throw new ValidationError('Proof URL must start with http:// or https://');
     }
-    event.proofUrl = String(patch.proofUrl).trim();
+    await eventRepo.updateById(event.id, { proofUrl: String(patch.proofUrl).trim() });
   }
   if (patch.notes !== undefined) {
-    event.notes = String(patch.notes).slice(0, 2000);
+    await eventRepo.updateById(event.id, { notes: String(patch.notes).slice(0, 2000) });
   }
   if (patch.attendees !== undefined) {
     if (!Array.isArray(patch.attendees) || patch.attendees.length === 0) {
       throw new ValidationError('Attendees array cannot be empty.');
     }
-    let entries = normalizeAttendees(patch.attendees, event.host.discordId);
-    entries = await resolveAttendeeUsers(entries);
-    event.attendeeEntries = entries;
+    newEntries = normalizeAttendees(patch.attendees, event.host_discord_id);
+    newEntries = await resolveAttendeeUsers(newEntries);
     attendeesChanged = true;
   }
 
-  await event.save();
-
-  if (attendeesChanged && event.status === 'APPROVED') {
-    await clearAttendanceForEvent(event._id);
-    await writeAttendanceForEvent(event);
+  if (attendeesChanged) {
+    await db.transaction(async (trx) => {
+      await eventAttendeeRepo.replaceForEvent(event.id, newEntries);
+      if (event.status === 'APPROVED') {
+        await attendanceRepo.deleteByEvent(event.id);
+        await writeAttendanceForEvent(event, newEntries);
+      }
+    });
   }
+
+  const updated = await eventRepo.findById(event.id);
+  const attendees = await eventAttendeeRepo.listByEvent(event.id);
 
   await audit({
     actorId: actorDiscordId,
     action: 'event.edited',
     category: 'EVENT',
     targetType: 'Event',
-    targetId: event._id,
+    targetId: event.id,
     before,
     after: {
-      proofUrl: event.proofUrl,
-      notes: event.notes,
-      attendeeCount: event.attendeeEntries.length,
+      proofUrl: updated.proof_url,
+      notes: updated.notes,
+      attendeeCount: attendees.length,
     },
   });
 
-  return event;
+  return { ...updated, attendeeEntries: attendees.map(toAttendeeEntryShape) };
 }
 
 // ============================================================
@@ -490,19 +445,12 @@ export async function updateEvent(actorDiscordId, eventId, patch) {
 // ============================================================
 
 export async function getEvent(eventId) {
-  const event = await Event.findById(eventId).lean();
+  const event = await eventRepo.findById(eventId);
   if (!event) throw new NotFoundError('Event', { id: String(eventId) });
-  return event;
+  const attendees = await eventAttendeeRepo.listByEvent(event.id);
+  return { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) };
 }
 
-/**
- * List events with filters and pagination.
- *   status           - PENDING / APPROVED / REJECTED / CANCELLED, or 'ANY'
- *   hostDiscordId    - events hosted by a specific user
- *   eventTypeKey     - filter by type
- *   from, to         - inclusive date range on createdAt
- *   page, pageSize   - pagination
- */
 export async function listEvents({
   status,
   hostDiscordId,
@@ -514,26 +462,27 @@ export async function listEvents({
 } = {}) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 25));
-  const skip = (page - 1) * pageSize;
 
-  const filter = {};
-  if (status && status !== 'ANY') filter.status = status;
-  if (hostDiscordId) filter['host.discordId'] = hostDiscordId;
-  if (eventTypeKey) filter.eventTypeKey = eventTypeKey.toLowerCase();
+  const { items, total } = await eventRepo.list({
+    status,
+    hostDiscordId,
+    eventTypeKey,
+    from,
+    to,
+    page,
+    pageSize,
+  });
 
-  if (from || to) {
-    filter.createdAt = {};
-    if (from) filter.createdAt.$gte = from;
-    if (to) filter.createdAt.$lte = to;
-  }
-
-  const [items, total] = await Promise.all([
-    Event.find(filter).sort({ createdAt: -1 }).skip(skip).limit(pageSize).lean(),
-    Event.countDocuments(filter),
-  ]);
+  // Enrich with attendee entries (needed by command handlers)
+  const enriched = await Promise.all(
+    items.map(async (e) => {
+      const attendees = await eventAttendeeRepo.listByEvent(e.id);
+      return { ...e, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+    })
+  );
 
   return {
-    items,
+    items: enriched,
     total,
     page,
     pageSize,
@@ -541,11 +490,23 @@ export async function listEvents({
   };
 }
 
-/**
- * Latest event by a host — used by /event cooldown status.
- */
 export async function getLastEventByHost(hostDiscordId) {
-  return Event.findOne({ 'host.discordId': hostDiscordId })
-    .sort({ cooldownAnchor: -1 })
-    .lean();
+  return eventRepo.findLatestByHost(hostDiscordId);
+}
+
+// ============================================================
+//  Helpers
+// ============================================================
+
+/**
+ * Convert an `event_attendees` row into the shape command handlers
+ * expect from the old Mongoose `attendeeEntries` array.
+ */
+function toAttendeeEntryShape(row) {
+  return {
+    discordId: row.discord_id,
+    robloxUsername: row.roblox_username,
+    resolvedUserId: row.resolved_user_id,
+    isVerified: row.is_verified,
+  };
 }

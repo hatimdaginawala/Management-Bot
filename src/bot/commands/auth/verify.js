@@ -12,17 +12,21 @@ export const meta = {
 };
 
 export async function execute(interaction) {
-  const { user, robloxUser, verification } =
+  const { robloxUser, verification } =
     await verificationService.completeVerification(interaction.user.id);
+
+  const linkedAt = verification.verified_at
+    ? new Date(verification.verified_at)
+    : new Date();
 
   const embed = successEmbed({
     title: 'Account Verified',
-    description: `Your Discord account is now linked to **${robloxUser.name}**.`,
+    description: 'Your Discord account is now linked to **' + robloxUser.name + '**.',
     fields: [
-      { name: 'Roblox ID', value: `\`${robloxUser.id}\``, inline: true },
+      { name: 'Roblox ID', value: '`' + robloxUser.id + '`', inline: true },
       {
         name: 'Linked At',
-        value: `<t:${Math.floor(verification.verifiedAt.getTime() / 1000)}:R>`,
+        value: '<t:' + Math.floor(linkedAt.getTime() / 1000) + ':R>',
         inline: true,
       },
     ],
@@ -30,7 +34,6 @@ export async function execute(interaction) {
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 
-  // Best-effort DM.
   try {
     await interaction.user.send({ embeds: [embed] });
   } catch {

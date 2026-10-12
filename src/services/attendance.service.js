@@ -1,8 +1,6 @@
-import {
-  Attendance,
-  User,
-  Event,
-} from '../models/index.js';
+import * as attendanceRepo from '../db/repositories/attendance.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as eventRepo from '../db/repositories/event.repository.js';
 import { audit } from '../utils/audit.js';
 import {
   ValidationError,
@@ -12,35 +10,13 @@ import {
 import logger from '../config/logger.js';
 
 /**
- * Attendance service.
- *
- * Read + manual write operations on the Attendance collection.
- * Automatic writes (event approval fan-out) live in event.service.
- *
- * Every manual operation is idempotent:
- *   - addManualAttendance upserts on (event, user).
- *   - removeManualAttendance updates in place; re-running is a no-op.
- *
- * Soft-delete semantics: removing attendance never deletes the row.
- * It flips `active: false` and `status: 'MANUAL_REMOVED'`, preserving
- * history for auditing and statistics.
+ * Attendance service. Public API unchanged.
  */
 
 // ============================================================
 //  Reads
 // ============================================================
 
-/**
- * List attendance records with filters + pagination.
- *
- * Filters:
- *   userDiscordId  - only records for this user
- *   eventId        - only records for this event
- *   eventTypeKey   - filter by event type
- *   from, to       - inclusive date range on eventAt
- *   includeInactive - default false; true includes MANUAL_REMOVED rows
- *   page, pageSize
- */
 export async function listAttendance({
   userDiscordId,
   eventId,
@@ -53,28 +29,17 @@ export async function listAttendance({
 } = {}) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(200, Math.max(1, Number(pageSize) || 50));
-  const skip = (page - 1) * pageSize;
 
-  const filter = {};
-  if (!includeInactive) filter.active = true;
-  if (userDiscordId) filter.discordId = userDiscordId;
-  if (eventId) filter.event = eventId;
-  if (eventTypeKey) filter.eventTypeKey = eventTypeKey.toLowerCase();
-
-  if (from || to) {
-    filter.eventAt = {};
-    if (from) filter.eventAt.$gte = from;
-    if (to) filter.eventAt.$lte = to;
-  }
-
-  const [items, total] = await Promise.all([
-    Attendance.find(filter)
-      .sort({ eventAt: -1 })
-      .skip(skip)
-      .limit(pageSize)
-      .lean(),
-    Attendance.countDocuments(filter),
-  ]);
+  const { items, total } = await attendanceRepo.list({
+    userDiscordId,
+    eventId,
+    eventTypeKey,
+    from,
+    to,
+    includeInactive,
+    page,
+    pageSize,
+  });
 
   return {
     items,
@@ -85,122 +50,72 @@ export async function listAttendance({
   };
 }
 
-/**
- * Chronological attendance history for a single user.
- * Returns all records (active and inactive) so the caller can show
- * "was removed by admin" entries.
- */
 export async function getAttendanceHistory(discordId, { limit = 50 } = {}) {
-  const user = await User.findOne({ discordId }).lean();
+  const user = await userRepo.findByDiscordId(discordId);
   if (!user) throw new NotFoundError('User', { discordId });
 
-  const records = await Attendance.find({ user: user._id })
-    .sort({ eventAt: -1 })
-    .limit(Math.min(200, Math.max(1, Number(limit) || 50)))
-    .lean();
-
+  const records = await attendanceRepo.historyForDiscordId(discordId, { limit });
   const activeCount = records.filter((r) => r.active).length;
   const inactiveCount = records.length - activeCount;
 
   return { user, records, activeCount, inactiveCount };
 }
 
-/**
- * Aggregated attendance counts.
- *
- * Modes:
- *   - byUser:   top attendees in the time range
- *   - byType:   totals per event type
- *   - byWeek:   counts grouped by ISO week
- *   - total:    single number
- *
- * `from` and `to` are inclusive Date boundaries on `eventAt`.
- */
 export async function attendanceStats({
   mode = 'total',
   from,
   to,
   limit = 10,
 } = {}) {
-  const match = { active: true };
-  if (from || to) {
-    match.eventAt = {};
-    if (from) match.eventAt.$gte = from;
-    if (to) match.eventAt.$lte = to;
-  }
-
   if (mode === 'total') {
-    const total = await Attendance.countDocuments(match);
-    return { mode, total };
+    const counts = await attendanceRepo.distinctCountsInRange({ from, to });
+    return { mode, total: counts.total };
   }
 
   if (mode === 'byUser') {
-    const rows = await Attendance.aggregate([
-      { $match: match },
-      { $group: { _id: '$user', count: { $sum: 1 }, discordId: { $first: '$discordId' } } },
-      { $sort: { count: -1, _id: 1 } },
-      { $limit: Math.min(100, Math.max(1, Number(limit) || 10)) },
-    ]);
+    const rows = await attendanceRepo.topAttendeesInRange({ from, to, limit });
+    // Repo returns { discordId, count }
     return { mode, rows };
   }
 
   if (mode === 'byType') {
-    const rows = await Attendance.aggregate([
-      { $match: match },
-      { $group: { _id: '$eventTypeKey', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]);
-    return { mode, rows };
+    const rows = await attendanceRepo.countByTypeInRange({ from, to });
+    // Repo returns { typeKey, count }
+    return { mode, rows: rows.map((r) => ({ _id: r.typeKey, count: r.count })) };
   }
 
   if (mode === 'byWeek') {
-    // Group by ISO year + week. Mongo's $isoWeek / $isoWeekYear are
-    // available in MongoDB 3.4+, which we exceed.
-    const rows = await Attendance.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: {
-            year: { $isoWeekYear: '$eventAt' },
-            week: { $isoWeek: '$eventAt' },
-          },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { '_id.year': -1, '_id.week': -1 } },
-      { $limit: Math.min(100, Math.max(1, Number(limit) || 10)) },
-    ]);
-    return { mode, rows };
+    // Aggregation by ISO week is not exposed via the repository yet.
+    // Fall back to loading rows and grouping in JS for now.
+    const { items } = await attendanceRepo.list({ from, to, pageSize: 200 });
+    const buckets = new Map();
+    for (const r of items) {
+      const { year, week } = isoWeekParts(new Date(r.event_at));
+      const key = year + '-' + String(week).padStart(2, '0');
+      buckets.set(key, (buckets.get(key) || 0) + 1);
+    }
+    const rows = Array.from(buckets.entries()).map(([k, count]) => {
+      const [year, week] = k.split('-');
+      return { _id: { year: Number(year), week: Number(week) }, count };
+    });
+    rows.sort((a, b) =>
+      b._id.year - a._id.year || b._id.week - a._id.week
+    );
+    return { mode, rows: rows.slice(0, limit) };
   }
 
-  throw new ValidationError(`Unknown stats mode: ${mode}`);
+  throw new ValidationError('Unknown stats mode: ' + mode);
 }
 
 // ============================================================
 //  Manual writes
 // ============================================================
 
-/**
- * Manually add a user to an event's attendance.
- *
- * Behaviour:
- *   - If no row exists: create with status MANUAL_ADDED.
- *   - If a row exists and is active: no-op (return existing).
- *   - If a row exists and is inactive (previously removed):
- *     reactivate with status MANUAL_ADDED.
- *
- * The event MUST be APPROVED. Adding attendance to a PENDING event
- * would be inconsistent with how quota/statistics count "approved"
- * attendance. If the event is later approved, the normal fan-out
- * will run and skip this user (uniq_event_user prevents a second row).
- *
- * `eventAt` is taken from the event so weekly aggregation works
- * regardless of when the manual add happened.
- */
-export async function addManualAttendance(
-  actorDiscordId,
-  { eventId, userDiscordId, reason = null } = {}
-) {
+export async function addManualAttendance(actorDiscordId, {
+  eventId,
+  userDiscordId,
+  reason = null,
+} = {}) {
   if (!eventId) throw new ValidationError('eventId is required.');
   if (!userDiscordId) throw new ValidationError('userDiscordId is required.');
   if (reason !== null && typeof reason !== 'string') {
@@ -208,52 +123,38 @@ export async function addManualAttendance(
   }
 
   const [event, user] = await Promise.all([
-    Event.findById(eventId).lean(),
-    User.findOne({ discordId: userDiscordId }).lean(),
+    eventRepo.findById(eventId),
+    userRepo.findByDiscordId(userDiscordId),
   ]);
   if (!event) throw new NotFoundError('Event', { id: String(eventId) });
   if (!user) throw new NotFoundError('User', { discordId: userDiscordId });
 
   if (event.status !== 'APPROVED') {
-    throw new ConflictError(
-      'Attendance can only be added to APPROVED events.'
-    );
+    throw new ConflictError('Attendance can only be added to APPROVED events.');
   }
-
-  if (event.host?.discordId === userDiscordId) {
+  if (event.host_discord_id === userDiscordId) {
     throw new ValidationError('The host cannot be added as an attendee.');
   }
 
-  const result = await Attendance.updateOne(
-    { event: event._id, user: user._id },
-    {
-      $set: {
-        event: event._id,
-        eventTypeKey: event.eventTypeKey,
-        user: user._id,
-        discordId: user.discordId,
-        robloxId: user.robloxId ?? null,
-        eventAt: event.createdAt ?? new Date(),
-        status: 'MANUAL_ADDED',
-        addedBy: actorDiscordId,
-        removedBy: null,
-        reason,
-        active: true,
-      },
-    },
-    { upsert: true }
-  );
-
-  const record = await Attendance.findOne({ event: event._id, user: user._id }).lean();
+  const record = await attendanceRepo.upsertManual({
+    eventId: event.id,
+    eventTypeKey: event.event_type_key,
+    userId: user.id,
+    discordId: user.discord_id,
+    robloxId: user.roblox_id ?? null,
+    eventAt: event.created_at,
+    addedBy: actorDiscordId,
+    reason,
+  });
 
   await audit({
     actorId: actorDiscordId,
     action: 'attendance.manual_added',
     category: 'ATTENDANCE',
     targetType: 'Attendance',
-    targetId: record._id,
+    targetId: record.id,
     after: {
-      eventId: String(event._id),
+      eventId: event.id,
       userDiscordId,
       status: 'MANUAL_ADDED',
     },
@@ -261,27 +162,18 @@ export async function addManualAttendance(
   });
 
   logger.info(
-    { actorDiscordId, userDiscordId, eventId: String(event._id), created: result.upsertedCount === 1 },
+    { actorDiscordId, userDiscordId, eventId: event.id },
     'Manual attendance added'
   );
 
   return record;
 }
 
-/**
- * Soft-remove a user's attendance from an event.
- *
- * Behaviour:
- *   - If no row exists: throw NotFoundError (nothing to remove).
- *   - If a row exists and is inactive: no-op (return existing).
- *   - If a row exists and is active: set inactive + MANUAL_REMOVED.
- *
- * A reason is required.
- */
-export async function removeManualAttendance(
-  actorDiscordId,
-  { eventId, userDiscordId, reason } = {}
-) {
+export async function removeManualAttendance(actorDiscordId, {
+  eventId,
+  userDiscordId,
+  reason,
+} = {}) {
   if (!eventId) throw new ValidationError('eventId is required.');
   if (!userDiscordId) throw new ValidationError('userDiscordId is required.');
   if (!reason || reason.trim().length < 3) {
@@ -289,13 +181,20 @@ export async function removeManualAttendance(
   }
 
   const [event, user] = await Promise.all([
-    Event.findById(eventId).lean(),
-    User.findOne({ discordId: userDiscordId }).lean(),
+    eventRepo.findById(eventId),
+    userRepo.findByDiscordId(userDiscordId),
   ]);
   if (!event) throw new NotFoundError('Event', { id: String(eventId) });
   if (!user) throw new NotFoundError('User', { discordId: userDiscordId });
 
-  const existing = await Attendance.findOne({ event: event._id, user: user._id });
+  // Find the row to determine if it exists.
+  const { items } = await attendanceRepo.list({
+    userDiscordId,
+    eventId: event.id,
+    includeInactive: true,
+    pageSize: 1,
+  });
+  const existing = items[0];
   if (!existing) {
     throw new NotFoundError('Attendance record', {
       eventId: String(eventId),
@@ -303,54 +202,62 @@ export async function removeManualAttendance(
     });
   }
 
-  if (!existing.active) {
-    // Already inactive — idempotent no-op.
-    return existing.toObject();
-  }
+  // Already inactive → no-op
+  if (!existing.active) return existing;
 
-  existing.active = false;
-  existing.status = 'MANUAL_REMOVED';
-  existing.removedBy = actorDiscordId;
-  existing.reason = reason.trim();
-  await existing.save();
+  const removed = await attendanceRepo.deactivate(event.id, user.id, {
+    removedBy: actorDiscordId,
+    reason: reason.trim(),
+  });
+  if (!removed) return existing;
 
   await audit({
     actorId: actorDiscordId,
     action: 'attendance.manual_removed',
     category: 'ATTENDANCE',
     targetType: 'Attendance',
-    targetId: existing._id,
+    targetId: existing.id,
     before: { active: true, status: 'PRESENT' },
     after: { active: false, status: 'MANUAL_REMOVED' },
     reason: reason.trim(),
   });
 
-  return existing.toObject();
+  const { items: after } = await attendanceRepo.list({
+    userDiscordId,
+    eventId: event.id,
+    includeInactive: true,
+    pageSize: 1,
+  });
+  return after[0];
 }
 
 // ============================================================
 //  Convenience reads used by other services
 // ============================================================
 
-/**
- * Count of active attendance for a user in a time range.
- * Used by quota evaluation (Phase 9).
- * `from` inclusive, `to` exclusive.
- */
-export async function countAttendanceForUser(userObjectId, { from, to } = {}) {
-  const filter = { user: userObjectId, active: true };
-  if (from || to) {
-    filter.eventAt = {};
-    if (from) filter.eventAt.$gte = from;
-    if (to) filter.eventAt.$lt = to;
-  }
-  return Attendance.countDocuments(filter);
+export async function countAttendanceForUser(userId, { from, to } = {}) {
+  return attendanceRepo.countActiveForUserInRange(userId, { from, to });
 }
 
-/**
- * Total attendance recorded for an event (active only).
- * Used by /event view.
- */
-export async function countAttendanceForEvent(eventObjectId) {
-  return Attendance.countDocuments({ event: eventObjectId, active: true });
+export async function countAttendanceForEvent(eventId) {
+  return attendanceRepo.countActiveForEvent(eventId);
+}
+
+// ============================================================
+//  Internal helpers
+// ============================================================
+
+function isoWeekParts(date) {
+  const d = new Date(Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate()
+  ));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+
+  const year = d.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(year, 0, 1));
+  const week = Math.ceil(((d - yearStart) / 86_400_000 + 1) / 7);
+  return { year, week };
 }

@@ -1,36 +1,42 @@
-import { EventType } from '../models/index.js';
+import * as eventTypeRepo from '../db/repositories/eventType.repository.js';
 import { audit } from '../utils/audit.js';
 import { ConflictError, NotFoundError, ValidationError } from '../utils/errors.js';
 import logger from '../config/logger.js';
 
 /**
- * Event type service. Backs /event-types and the select menus in /event create.
- * Seeded at install; High Command may add/disable types.
+ * Event type service. Public API unchanged from the Mongoose version.
  */
 
 export async function listEventTypes({ includeInactive = false } = {}) {
-  const filter = includeInactive ? {} : { active: true };
-  return EventType.find(filter).sort({ sortOrder: 1, name: 1 }).lean();
+  return eventTypeRepo.list({ includeInactive });
 }
 
 export async function getEventTypeByKey(key) {
-  const et = await EventType.findOne({ key: key.toLowerCase() }).lean();
+  const et = await eventTypeRepo.findByKey(key);
   if (!et) throw new NotFoundError('Event type', { key });
   return et;
 }
 
-export async function createEventType(actorId, { key, name, description = '', sortOrder = 0, countsForQuota = true }) {
+export async function createEventType(actorId, {
+  key,
+  name,
+  description = '',
+  sortOrder = 0,
+  countsForQuota = true,
+}) {
   if (!key || !/^[a-z][a-z0-9_]{1,40}$/.test(key)) {
-    throw new ValidationError('Event type key must be lowercase, start with a letter, 2–41 chars.');
+    throw new ValidationError(
+      'Event type key must be lowercase, start with a letter, 2–41 chars.'
+    );
   }
   if (!name || name.length > 60) {
     throw new ValidationError('Event type name is required and ≤ 60 chars.');
   }
 
-  const existing = await EventType.findOne({ key: key.toLowerCase() });
-  if (existing) throw new ConflictError(`Event type "${key}" already exists.`);
+  const existing = await eventTypeRepo.findByKey(key);
+  if (existing) throw new ConflictError('Event type "' + key + '" already exists.');
 
-  const et = await EventType.create({
+  const et = await eventTypeRepo.create({
     key: key.toLowerCase(),
     name,
     description,
@@ -46,63 +52,68 @@ export async function createEventType(actorId, { key, name, description = '', so
     action: 'eventType.created',
     category: 'EVENT',
     targetType: 'EventType',
-    targetId: et._id,
-    after: et.toObject(),
+    targetId: et.id,
+    after: et,
   });
   return et;
 }
 
 export async function editEventType(actorId, key, patch) {
-  const et = await EventType.findOne({ key: key.toLowerCase() });
+  const et = await eventTypeRepo.findByKey(key);
   if (!et) throw new NotFoundError('Event type', { key });
-  if (!et.isDeletable) {
-    // Seeded types are protected from structural edits; you may still toggle `active`.
+
+  if (!et.is_deletable) {
     const allowed = ['active', 'sortOrder'];
     for (const k of Object.keys(patch)) {
       if (!allowed.includes(k)) {
-        throw new ValidationError(`Seeded event type "${et.key}" cannot change field "${k}".`);
+        throw new ValidationError(
+          'Seeded event type "' + et.key + '" cannot change field "' + k + '".'
+        );
       }
     }
   }
 
-  const before = et.toObject();
+  const before = { ...et };
+
+  // Map camelCase patch keys to repository fields
+  const repoPatch = {};
   for (const k of ['name', 'description', 'sortOrder', 'countsForQuota', 'active']) {
-    if (patch[k] !== undefined) et[k] = patch[k];
+    if (patch[k] !== undefined) repoPatch[k] = patch[k];
   }
-  await et.save();
+
+  const updated = await eventTypeRepo.updateById(et.id, repoPatch);
 
   await audit({
     actorId,
     action: 'eventType.edited',
     category: 'EVENT',
     targetType: 'EventType',
-    targetId: et._id,
+    targetId: et.id,
     before,
-    after: et.toObject(),
+    after: updated,
   });
-  return et;
+  return updated;
 }
 
 export async function disableEventType(actorId, key, { reason = null } = {}) {
-  const et = await EventType.findOne({ key: key.toLowerCase() });
+  const et = await eventTypeRepo.findByKey(key);
   if (!et) throw new NotFoundError('Event type', { key });
-  et.active = false;
-  await et.save();
+
+  const updated = await eventTypeRepo.updateById(et.id, { active: false });
 
   await audit({
     actorId,
     action: 'eventType.disabled',
     category: 'EVENT',
     targetType: 'EventType',
-    targetId: et._id,
+    targetId: et.id,
     before: { active: true },
     after: { active: false },
     reason,
   });
-  return et;
+  return updated;
 }
 
 export async function activeEventTypeKeys() {
-  const types = await EventType.find({ active: true }).select('key').lean();
-  return types.map((t) => t.key);
+  return eventTypeRepo.listActiveKeys();
 }

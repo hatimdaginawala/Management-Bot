@@ -1,28 +1,18 @@
 import http from 'node:http';
-import mongoose from 'mongoose';
+
 import config from './config/index.js';
 import logger from './config/logger.js';
 import { createApp } from './app.js';
-import { startScheduler, stopScheduler } from './jobs/runner.js';
-import {
-  connectDatabase,
-  disconnectDatabase,
-} from './config/database.js';
-
+import { connectDatabase, disconnectDatabase } from './db/client.js';
 import { createDiscordClient } from './bot/client.js';
 import { loadEventHandlers } from './bot/eventHandlers/index.js';
-import './models/index.js';
+import { startScheduler, stopScheduler } from './jobs/runner.js';
+
 async function bootstrap() {
   logger.info({ env: config.env }, 'Starting 24th Guard Rifles Management Bot');
 
-  // 1. Database
   await connectDatabase();
-  logger.info(
-  { models: mongoose.modelNames() },
-  'Mongoose models registered'
-);
 
-  // 2. Express
   const app = createApp();
   const server = http.createServer(app);
 
@@ -34,7 +24,6 @@ async function bootstrap() {
     });
   });
 
-  // 3. Discord
   const client = createDiscordClient();
   await loadEventHandlers(client);
 
@@ -44,10 +33,9 @@ async function bootstrap() {
       'Discord login failed. HTTP server remains up.'
     );
   });
-    // 5. Start the scheduler (cron jobs).
+
   startScheduler({ client });
 
-  // 4. Graceful shutdown
   let shuttingDown = false;
   async function shutdown(signal) {
     if (shuttingDown) return;
@@ -61,6 +49,8 @@ async function bootstrap() {
     timeout.unref();
 
     try {
+      stopScheduler();
+
       await new Promise((resolve) => server.close(resolve));
       logger.info('HTTP server closed');
 
@@ -68,7 +58,7 @@ async function bootstrap() {
         await client.destroy();
         logger.info('Discord client destroyed');
       }
-      stopScheduler();
+
       await disconnectDatabase();
 
       clearTimeout(timeout);
@@ -92,8 +82,6 @@ async function bootstrap() {
 }
 
 bootstrap().catch((err) => {
-  // Logger may not be fully configured; fall back to console.
-  // eslint-disable-next-line no-console
   console.error('Fatal bootstrap error:', err);
   process.exit(1);
 });

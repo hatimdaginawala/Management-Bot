@@ -1,30 +1,67 @@
-import mongoose from 'mongoose';
+import knex from 'knex';
 import config from './index.js';
 import logger from './logger.js';
+
+/**
+ * Knex connection factory.
+ *
+ * Exposes:
+ *   - `db`          the Knex instance (query builder)
+ *   - `connectDatabase()`  verifies connectivity at boot
+ *   - `disconnectDatabase()`  closes the pool on shutdown
+ *   - `isDatabaseHealthy()`   boolean for /health
+ */
+
+const clientOptions = {
+  client: 'mysql2',
+  connection: {
+    host: config.mysql.host,
+    port: config.mysql.port,
+    user: config.mysql.user,
+    password: config.mysql.password,
+    database: config.mysql.database,
+    charset: 'utf8mb4',
+    timezone: 'Z',
+    supportBigNumbers: true,
+    bigNumberStrings: false,
+  },
+  pool: {
+    min: 2,
+    max: 10,
+    afterCreate: (connection, done) => {
+      connection.query("SET time_zone = '+00:00'", (err) => {
+        done(err, connection);
+      });
+    },
+  },
+};
+
+export const db = knex(clientOptions);
 
 let isConnected = false;
 
 /**
- * Connect to MongoDB. Retries with exponential backoff on failure.
+ * Verify the connection works. Runs a trivial `SELECT 1`.
+ * Retries with exponential backoff on failure.
  */
 export async function connectDatabase({ retries = 5, delayMs = 2000 } = {}) {
-  if (isConnected) return mongoose.connection;
-
-  mongoose.set('strictQuery', true);
-
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      await mongoose.connect(config.mongo.uri, {
-        serverSelectionTimeoutMS: 10_000,
-        socketTimeoutMS: 45_000,
-      });
+      await db.raw('SELECT 1');
       isConnected = true;
-      logger.info({ uri: maskUri(config.mongo.uri) }, 'MongoDB connected');
-      return mongoose.connection;
+      logger.info(
+        {
+          host: config.mysql.host,
+          port: config.mysql.port,
+          database: config.mysql.database,
+        },
+        'MySQL connected'
+      );
+      return;
     } catch (err) {
       logger.error(
         { attempt, retries, err: err.message },
-        'MongoDB connection failed'
+        'MySQL connection failed'
       );
       if (attempt === retries) throw err;
       const wait = delayMs * attempt;
@@ -34,23 +71,23 @@ export async function connectDatabase({ retries = 5, delayMs = 2000 } = {}) {
 }
 
 /**
- * Disconnect from MongoDB (used on shutdown).
+ * Close the pool. Called during graceful shutdown.
  */
 export async function disconnectDatabase() {
   if (!isConnected) return;
-  await mongoose.disconnect();
+  await db.destroy();
   isConnected = false;
-  logger.info('MongoDB disconnected');
+  logger.info('MySQL disconnected');
 }
 
 /**
- * Return true if MongoDB is currently reachable.
- * Used by /health.
+ * Health check for the REST /health endpoint.
  */
-export function isDatabaseHealthy() {
-  return mongoose.connection.readyState === 1;
-}
-
-function maskUri(uri) {
-  return uri.replace(/\/\/[^@]+@/, '//***:***@');
+export async function isDatabaseHealthy() {
+  try {
+    await db.raw('SELECT 1');
+    return true;
+  } catch {
+    return false;
+  }
 }

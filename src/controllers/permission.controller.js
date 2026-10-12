@@ -1,8 +1,8 @@
-import { Permission } from '../models/index.js';
+import * as permissionRepo from '../db/repositories/permission.repository.js';
 import * as permissionService from '../services/permission.service.js';
 
 export async function listPermissions(req, res) {
-  const items = await Permission.find({}).sort({ category: 1, key: 1 }).lean();
+  const items = await permissionRepo.list();
   res.json({ success: true, data: items });
 }
 

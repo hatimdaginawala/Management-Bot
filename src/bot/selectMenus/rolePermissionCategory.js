@@ -4,7 +4,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
-import { Permission } from '../../models/index.js';
+import * as permissionRepo from '../../db/repositories/permission.repository.js';
 import { infoEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
 
@@ -23,30 +23,24 @@ export async function execute(interaction) {
 
   if (!flowKind) {
     return interaction.update({
-      embeds: [infoEmbed({
-        title: 'Session Expired',
-        description: 'Please run the command again.',
-      })],
+      embeds: [infoEmbed({ title: 'Session Expired', description: 'Please run the command again.' })],
       components: [],
     });
   }
 
   const session = sessions.getSession(flowKind, discordId);
-  const permsInCategory = await Permission.find({ category })
-    .sort({ key: 1 })
-    .lean();
+
+  // Fetch all permissions and filter to category.
+  const allPerms = await permissionRepo.list();
+  const permsInCategory = allPerms.filter((p) => p.category === category).sort((a, b) => a.key.localeCompare(b.key));
 
   if (permsInCategory.length === 0) {
     return interaction.update({
-      embeds: [infoEmbed({
-        title: 'No Permissions',
-        description: 'No permissions in that category.',
-      })],
+      embeds: [infoEmbed({ title: 'No Permissions', description: 'No permissions in that category.' })],
       components: [],
     });
   }
 
-  // Show the category's permissions, pre-selecting ones already chosen.
   const already = new Set(session.permissions);
   const options = permsInCategory.slice(0, 25).map((p) => ({
     label: p.key.slice(0, 100),
@@ -74,9 +68,6 @@ export async function execute(interaction) {
 
   const row1 = new ActionRowBuilder().addComponents(permMenu);
   const row2 = new ActionRowBuilder().addComponents(backButton, clearCategoryButton);
-
-  // Note: submit happens when the user opens the menu and clicks outside / hits enter.
-  // We prompt them to "Select all that apply, then click Back to Categories".
 
   return interaction.update({
     embeds: [infoEmbed({

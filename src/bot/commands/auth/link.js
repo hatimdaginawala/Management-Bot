@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 import * as verificationService from '../../../services/verification.service.js';
-import { infoEmbed, warningEmbed } from '../../embedBuilders.js';
+import { infoEmbed } from '../../embedBuilders.js';
 import logger from '../../../config/logger.js';
 
 export const data = new SlashCommandBuilder()
@@ -17,7 +17,6 @@ export const data = new SlashCommandBuilder()
   .toJSON();
 
 export const meta = {
-  // Anyone can link — no permission required.
   cooldownSeconds: 30,
 };
 
@@ -29,21 +28,19 @@ export async function execute(interaction) {
     username
   );
 
-  // Build the instructions the user needs. This message contains the
-  // code, so it is delivered both as an ephemeral reply AND a DM.
   const instructions = [
-    `**Hi ${interaction.user.username}!** Here's how to finish linking:`,
+    '**Hi ' + interaction.user.username + '!** Here is how to finish linking:',
     '',
-    `**1.** Open your Roblox profile:`,
-    `    https://www.roblox.com/users/${robloxUser.id}/profile`,
+    '**1.** Open your Roblox profile:',
+    '    https://www.roblox.com/users/' + robloxUser.id + '/profile',
     '',
-    `**2.** Click **Edit Profile** and paste this code somewhere in your **About** section:`,
+    '**2.** Click **Edit Profile** and paste this code somewhere in your **About** section:',
     '',
-    `      \`${verification.code}\``,
+    '      `' + verification.code + '`',
     '',
-    `**3.** Save your profile, then run \`/verify\` here.`,
+    '**3.** Save your profile, then run `/verify` here.',
     '',
-    `**This code expires in 30 minutes.** If it expires, run \`/link\` again.`,
+    '**This code expires in 30 minutes.** If it expires, run `/link` again.',
   ].join('\n');
 
   const embed = infoEmbed({
@@ -52,22 +49,20 @@ export async function execute(interaction) {
     fields: [
       {
         name: 'Matched Roblox Account',
-        value: `**${robloxUser.name}** (ID: \`${robloxUser.id}\`)`,
+        value: '**' + robloxUser.name + '** (ID: `' + robloxUser.id + '`)',
         inline: false,
       },
     ],
   });
 
-  // Ephemeral reply always.
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 
-  // Try to DM the same content. Failure is non-fatal.
   try {
     await interaction.user.send({ embeds: [embed] });
   } catch (err) {
     logger.debug(
       { discordId: interaction.user.id, err: err.message },
-      'Could not DM verification code (user has DMs closed)'
+      'Could not DM verification code'
     );
   }
 }

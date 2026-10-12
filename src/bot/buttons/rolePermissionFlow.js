@@ -1,7 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import * as roleService from '../../services/role.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { successEmbed, infoEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
@@ -19,7 +19,7 @@ export async function execute(interaction) {
   const discordId = interaction.user.id;
   const action = interaction.customId;
 
-  const actor = await User.findOne({ discordId });
+  const actor = await userRepo.findByDiscordId(discordId);
   if (!actor) throw new AuthorizationError('You do not have permission.');
 
   const flowKind = sessions.getSession('role:create-flow', discordId)
@@ -37,18 +37,15 @@ export async function execute(interaction) {
 
   const session = sessions.getSession(flowKind, discordId);
 
-  // Back to categories
   if (action === 'role-flow:back') {
     return renderCategoryPicker(interaction, discordId, { flowKind });
   }
 
-  // Clear all
   if (action === 'role-flow:clear-all') {
     sessions.updateSession(flowKind, discordId, { permissions: [] });
     return renderCategoryPicker(interaction, discordId, { flowKind });
   }
 
-  // Clear one category
   if (action.startsWith('role-flow:clear-category:')) {
     const category = action.split(':')[2];
     const kept = session.permissions.filter(
@@ -58,10 +55,9 @@ export async function execute(interaction) {
     return renderCategoryPicker(interaction, discordId, { flowKind });
   }
 
-  // Done — create or edit
   if (action === 'role-flow:done') {
     const permissionKey = flowKind === 'role:create-flow' ? 'roles.create' : 'roles.edit';
-    const ok = await permissionService.hasPermission(actor._id, permissionKey);
+    const ok = await permissionService.hasPermission(actor.id, permissionKey);
     if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 
     await interaction.deferUpdate();
@@ -80,12 +76,11 @@ export async function execute(interaction) {
         return interaction.editReply({
           embeds: [successEmbed({
             title: 'Role Created',
-            description: 'Role `' + role.key + '` has been created with **' +
-              role.permissions.length + '** permission(s).',
+            description: 'Role `' + role.key + '` has been created with **' + role.permissions.length + '** permission(s).',
             fields: [
               { name: 'Name', value: role.name, inline: true },
               { name: 'Priority', value: String(role.priority), inline: true },
-              { name: 'Quota Category', value: '`' + role.quotaCategory + '`', inline: true },
+              { name: 'Quota Category', value: '`' + role.quota_category + '`', inline: true },
             ],
           })],
           components: [],
@@ -102,8 +97,7 @@ export async function execute(interaction) {
         return interaction.editReply({
           embeds: [successEmbed({
             title: 'Role Updated',
-            description: 'Role `' + role.key + '` has been updated with **' +
-              role.permissions.length + '** permission(s).',
+            description: 'Role `' + role.key + '` has been updated with **' + role.permissions.length + '** permission(s).',
           })],
           components: [],
         });

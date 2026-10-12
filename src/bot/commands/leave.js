@@ -9,42 +9,25 @@ import {
 } from 'discord.js';
 import * as leaveService from '../../services/leave.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { infoEmbed } from '../embedBuilders.js';
-import { paginate } from '../components/pagination.js';
 import * as sessions from '../sessions.js';
 import { formatDateRange, formatRelative, resolveUsernames, truncatePlain } from '../utils/format.js';
 
 export const data = new SlashCommandBuilder()
   .setName('leave')
   .setDescription('Leave requests and approvals.')
+  .addSubcommand((sub) => sub.setName('create').setDescription('Submit a leave request.'))
   .addSubcommand((sub) =>
-    sub.setName('create').setDescription('Submit a leave request.')
+    sub.setName('view').setDescription('View leave history for a user.')
+      .addUserOption((opt) => opt.setName('user').setDescription('Target user (default: yourself)'))
   )
-  .addSubcommand((sub) =>
-    sub
-      .setName('view')
-      .setDescription('View leave history for a user.')
-      .addUserOption((opt) =>
-        opt.setName('user').setDescription('Target user (default: yourself)')
-      )
-  )
-  .addSubcommand((sub) =>
-    sub.setName('active').setDescription('List currently active approved leaves.')
-  )
-  .addSubcommand((sub) =>
-    sub.setName('approve').setDescription('Approve a pending leave request.')
-  )
-  .addSubcommand((sub) =>
-    sub.setName('reject').setDescription('Reject a pending leave request.')
-  )
-  .addSubcommand((sub) =>
-    sub.setName('end').setDescription('End an approved leave early.')
-  )
-  .addSubcommand((sub) =>
-    sub.setName('cancel').setDescription('Cancel your own pending leave request.')
-  )
+  .addSubcommand((sub) => sub.setName('active').setDescription('List currently active approved leaves.'))
+  .addSubcommand((sub) => sub.setName('approve').setDescription('Approve a pending leave request.'))
+  .addSubcommand((sub) => sub.setName('reject').setDescription('Reject a pending leave request.'))
+  .addSubcommand((sub) => sub.setName('end').setDescription('End an approved leave early.'))
+  .addSubcommand((sub) => sub.setName('cancel').setDescription('Cancel your own pending leave request.'))
   .toJSON();
 
 export const meta = {};
@@ -63,10 +46,6 @@ export async function execute(interaction) {
       throw new Error('Unknown /leave subcommand: ' + sub);
   }
 }
-
-// ============================================================
-//  create
-// ============================================================
 
 async function handleCreate(interaction) {
   await assertPermission(interaction, 'leave.create');
@@ -111,10 +90,6 @@ async function handleCreate(interaction) {
   return interaction.showModal(modal);
 }
 
-// ============================================================
-//  view
-// ============================================================
-
 async function handleView(interaction) {
   await assertPermission(interaction, 'leave.view');
   const target = interaction.options.getUser('user') || interaction.user;
@@ -132,15 +107,9 @@ async function handleView(interaction) {
   }
 
   const lines = result.items.map((l) => {
-    const start = Math.floor(new Date(l.startAt).getTime() / 1000);
-    const end = Math.floor(new Date(l.endAt).getTime() / 1000);
-    const emoji = {
-      PENDING: '🟡',
-      APPROVED: '🟢',
-      REJECTED: '🔴',
-      EXPIRED: '⚫',
-      CANCELLED: '⚪',
-    }[l.status] || '⚪';
+    const start = Math.floor(new Date(l.start_at).getTime() / 1000);
+    const end = Math.floor(new Date(l.end_at).getTime() / 1000);
+    const emoji = { PENDING: '🟡', APPROVED: '🟢', REJECTED: '🔴', EXPIRED: '⚫', CANCELLED: '⚪' }[l.status] || '⚪';
     return emoji + ' <t:' + start + ':d> → <t:' + end + ':d> — **' + l.status + '**' +
            (l.reason ? '\n  _' + l.reason + '_' : '');
   });
@@ -154,32 +123,25 @@ async function handleView(interaction) {
   });
 }
 
-// ============================================================
-//  active
-// ============================================================
-
 async function handleActive(interaction) {
   await assertPermission(interaction, 'leave.view');
 
   const result = await leaveService.listLeaves({ status: 'APPROVED', pageSize: 100 });
   const now = new Date();
   const active = result.items.filter(
-    (l) => new Date(l.startAt) <= now && new Date(l.endAt) >= now
+    (l) => new Date(l.start_at) <= now && new Date(l.end_at) >= now
   );
 
   if (active.length === 0) {
     return interaction.reply({
-      embeds: [infoEmbed({
-        title: 'No Active Leaves',
-        description: 'No members are currently on approved leave.',
-      })],
+      embeds: [infoEmbed({ title: 'No Active Leaves', description: 'No members are currently on approved leave.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
 
   const lines = active.map((l) => {
-    const end = Math.floor(new Date(l.endAt).getTime() / 1000);
-    return '• <@' + l.discordId + '> — until <t:' + end + ':d> — ' + l.reason;
+    const end = Math.floor(new Date(l.end_at).getTime() / 1000);
+    return '• <@' + l.discord_id + '> — until <t:' + end + ':d> — ' + l.reason;
   });
 
   return interaction.reply({
@@ -190,10 +152,6 @@ async function handleActive(interaction) {
     flags: MessageFlags.Ephemeral,
   });
 }
-
-// ============================================================
-//  approve / reject / end — picker-driven
-// ============================================================
 
 async function startApproveFlow(interaction) {
   await assertPermission(interaction, 'leave.approve');
@@ -223,32 +181,24 @@ async function showLeavePicker(interaction, status, customId, title) {
     });
   }
 
-  // Bulk-resolve usernames (cache-friendly, no ObjectIds leaked).
   const usernames = await resolveUsernames(
     interaction.client,
-    result.items.map((l) => l.discordId)
+    result.items.map((l) => l.discord_id)
   );
 
   const options = result.items.map((l) => {
-    const username = usernames.get(l.discordId) || 'unknown user';
-    const period = formatDateRange(l.startAt, l.endAt);
-    const submittedAgo = formatRelative(l.createdAt);
+    const username = usernames.get(l.discord_id) || 'unknown user';
+    const period = formatDateRange(l.start_at, l.end_at);
+    const submittedAgo = formatRelative(l.created_at);
     const reasonSnippet = truncatePlain(l.reason || 'no reason', 60);
 
-    // Label max 100 chars: "@username"
     const label = ('@' + username).slice(0, 100);
-
-    // Description max 100 chars: "10 → 17 Oct 2026 · submitted 2 hours ago · reason"
     const description = truncatePlain(
       period + ' · submitted ' + submittedAgo + ' · ' + reasonSnippet,
       100
     );
 
-    return {
-      label,
-      description,
-      value: String(l._id),
-    };
+    return { label, description, value: String(l.id) };
   });
 
   const menu = new StringSelectMenuBuilder()
@@ -263,17 +213,12 @@ async function showLeavePicker(interaction, status, customId, title) {
   return interaction.reply({
     embeds: [infoEmbed({
       title: title,
-      description: '**' + result.total + '** ' + status.toLowerCase() +
-        ' request(s). Select the one you want to act on.',
+      description: '**' + result.total + '** ' + status.toLowerCase() + ' request(s). Select one to act on.',
     })],
     components: [row],
     flags: MessageFlags.Ephemeral,
   });
 }
-
-// ============================================================
-//  cancel — self-service
-// ============================================================
 
 async function handleCancel(interaction) {
   const result = await leaveService.listLeaves({
@@ -294,26 +239,22 @@ async function handleCancel(interaction) {
 
   if (result.total === 1) {
     const leave = result.items[0];
-    await leaveService.cancelLeave(interaction.user.id, leave._id, {
+    await leaveService.cancelLeave(interaction.user.id, leave.id, {
       reason: 'Cancelled by requester',
     });
     return interaction.reply({
-      embeds: [infoEmbed({
-        title: 'Leave Cancelled',
-        description: 'Your pending leave request has been cancelled.',
-      })],
+      embeds: [infoEmbed({ title: 'Leave Cancelled', description: 'Your pending leave request has been cancelled.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
 
-  // Multiple pending leaves — extremely rare, but handle it.
   const options = result.items.map((l) => {
-    const period = formatDateRange(l.startAt, l.endAt);
-    const submittedAgo = formatRelative(l.createdAt);
+    const period = formatDateRange(l.start_at, l.end_at);
+    const submittedAgo = formatRelative(l.created_at);
     return {
       label: truncatePlain('Requested ' + submittedAgo, 100),
       description: truncatePlain(period + ' · ' + (l.reason || 'no reason'), 100),
-      value: String(l._id),
+      value: String(l.id),
     };
   });
 
@@ -327,26 +268,15 @@ async function handleCancel(interaction) {
   const row = new ActionRowBuilder().addComponents(menu);
 
   return interaction.reply({
-    embeds: [infoEmbed({
-      title: 'Cancel Leave',
-      description: 'Select the pending leave you want to cancel.',
-    })],
+    embeds: [infoEmbed({ title: 'Cancel Leave', description: 'Select the pending leave you want to cancel.' })],
     components: [row],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-// ============================================================
-//  helpers
-// ============================================================
-
 async function assertPermission(interaction, permissionKey) {
-  const user = await User.findOne({ discordId: interaction.user.id });
-  if (!user) {
-    throw new AuthorizationError('You do not have permission to perform this action.');
-  }
-  const ok = await permissionService.hasPermission(user._id, permissionKey);
-  if (!ok) {
-    throw new AuthorizationError('You do not have permission to perform this action.');
-  }
+  const user = await userRepo.findByDiscordId(interaction.user.id);
+  if (!user) throw new AuthorizationError('You do not have permission to perform this action.');
+  const ok = await permissionService.hasPermission(user.id, permissionKey);
+  if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }

@@ -3,7 +3,7 @@ import * as eventService from '../../services/event.service.js';
 import * as permissionService from '../../services/permission.service.js';
 import { successEmbed, errorEmbed, COLORS } from '../embedBuilders.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { dmHost } from '../buttons/eventApproval.js';
 
 export const customId = 'modal:event-reject:*';
@@ -18,9 +18,9 @@ export async function execute(interaction) {
     });
   }
 
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'events.reject');
+  const ok = await permissionService.hasPermission(user.id, 'events.reject');
   if (!ok) throw new AuthorizationError('You do not have permission to reject events.');
 
   const reason = interaction.fields.getTextInputValue('reason').trim();
@@ -28,7 +28,6 @@ export async function execute(interaction) {
 
   const event = await eventService.rejectEvent(interaction.user.id, eventId, { reason });
 
-  // Update the original review message: reject styling + reason.
   try {
     const originalEmbed = interaction.message?.embeds?.[0];
     if (originalEmbed) {
@@ -38,11 +37,8 @@ export async function execute(interaction) {
         .addFields({ name: 'Rejection Reason', value: reason });
       await interaction.message.edit({ embeds: [updated], components: [] });
     }
-  } catch (err) {
-    // ignore
-  }
+  } catch {}
 
-  // DM the host.
   await dmHost(interaction.client, event, {
     title: 'Event Rejected',
     color: COLORS.ERROR,
@@ -51,12 +47,12 @@ export async function execute(interaction) {
     extraLine: 'Your event was rejected. Contact High Command if you believe this is an error.',
   });
 
-  const ts = Math.floor(new Date(event.createdAt).getTime() / 1000);
+  const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
 
   return interaction.reply({
     embeds: [successEmbed({
       title: 'Event Rejected',
-      description: 'Rejected **' + event.eventTypeKey + '** hosted by <@' + event.host.discordId + '> (logged <t:' + ts + ':R>).',
+      description: 'Rejected **' + event.event_type_key + '** hosted by <@' + event.host_discord_id + '> (logged <t:' + ts + ':R>).',
       fields: [{ name: 'Reason', value: reason, inline: false }],
     })],
     flags: MessageFlags.Ephemeral,
@@ -64,6 +60,6 @@ export async function execute(interaction) {
 }
 
 function extractEventId(customId) {
-  const m = /^modal:event-reject:([a-f0-9]{24})$/.exec(customId);
+  const m = /^modal:event-reject:(\d+)$/.exec(customId);
   return m ? m[1] : null;
 }

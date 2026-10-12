@@ -1,118 +1,67 @@
-import {
-  Strike,
-  User,
-  Settings,
-} from '../models/index.js';
+import * as strikeRepo from '../db/repositories/strike.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
+import * as settingsRepo from '../db/repositories/settings.repository.js';
 import { audit } from '../utils/audit.js';
 import {
   ValidationError,
   NotFoundError,
-  ConflictError,
 } from '../utils/errors.js';
 import logger from '../config/logger.js';
 
 /**
- * Strike service.
+ * Strike service. Public API unchanged.
  *
- * Owns every write path for the Strike collection. Every mutation is
- * audited. Idempotency:
- *
- *   - Quota-driven strikes use `uniq_quota_strike_per_user_period`,
- *     a partial-unique index on (user, quotaPeriodKey, type=QUOTA_MISSED).
- *     A second issuance for the same period returns { created: false }
- *     rather than throwing.
- *
- *   - Manual strikes have no unique constraint. Two manual strikes can
- *     coexist, which is intentional (staff may issue more than one for
- *     distinct reasons).
- *
- *   - Removal/cancellation operations are terminal transitions on the
- *     `status` field. Re-running them is a no-op.
- *
- * Threshold check (§25): after every successful issue we recount ACTIVE
- * strikes and, if the count reaches `settings.strikes.removalThreshold`,
- * we call removalRequestService.createFromThreshold. This is
- * idempotent thanks to RemovalRequest's own partial-unique index.
+ * Idempotency:
+ *   - ensureQuotaStrike uses a pre-check for the unique
+ *     (user_id, type='QUOTA_MISSED', quota_period_key) tuple.
+ *   - cancelAtomic and recoverAtomic are status CAS operations.
  */
+
+const DEFAULT_THRESHOLD = 3;
 
 // ============================================================
 //  Issuance
 // ============================================================
 
-/**
- * Issue a strike for a missed quota period.
- *
- * Idempotent: re-issuing for the same (user, period) returns
- * { created: false, strike: <existing> }.
- *
- * Always calls checkThresholdAndCreateRemoval on successful creation.
- */
 export async function issueQuotaStrike({ user, period, reason }) {
-  if (!user?._id || !period?.periodKey) {
+  if (!user?.id || !period?.periodKey) {
     throw new ValidationError('issueQuotaStrike requires user and period.');
   }
 
-  // Pre-check: does a QUOTA_MISSED strike already exist for this (user, period)?
-  const existing = await Strike.findOne({
-    user: user._id,
+  const { created, row: strike } = await strikeRepo.ensureQuotaStrike({
+    userId: user.id,
+    discordId: user.discord_id,
     quotaPeriodKey: period.periodKey,
-    type: 'QUOTA_MISSED',
-  }).lean();
-  if (existing) {
-    return { created: false, strike: existing };
-  }
+    reason: reason || 'Missed quota for period ' + period.periodKey + '.',
+    issuedBy: 'system',
+  });
 
-  // Try to create. The partial-unique index protects against a race.
-  try {
-    const strike = await Strike.create({
-      user: user._id,
-      discordId: user.discordId,
-      type: 'QUOTA_MISSED',
-      quotaPeriodKey: period.periodKey,
-      reason: reason || `Missed quota for period ${period.periodKey}.`,
-      issuedBy: 'system',
-      status: 'ACTIVE',
-    });
-
+  if (created) {
     await audit({
       actorId: 'system',
       action: 'strike.issued',
       category: 'STRIKE',
       targetType: 'Strike',
-      targetId: strike._id,
+      targetId: strike.id,
       after: {
-        userId: String(user._id),
-        discordId: user.discordId,
+        userId: String(user.id),
+        discordId: user.discord_id,
         type: 'QUOTA_MISSED',
         quotaPeriodKey: period.periodKey,
       },
     });
 
     logger.info(
-      { strikeId: String(strike._id), discordId: user.discordId, period: period.periodKey },
+      { strikeId: strike.id, discordId: user.discord_id, period: period.periodKey },
       'Quota strike issued'
     );
 
     await checkThresholdAndCreateRemoval(user);
-
-    return { created: true, strike: strike.toObject() };
-  } catch (err) {
-    if (err.code === 11000) {
-      const winner = await Strike.findOne({
-        user: user._id,
-        quotaPeriodKey: period.periodKey,
-        type: 'QUOTA_MISSED',
-      }).lean();
-      return { created: false, strike: winner };
-    }
-    throw err;
   }
+
+  return { created, strike };
 }
 
-/**
- * Issue a manual strike.
- * Requires a reason. Not idempotent — each call creates a new row.
- */
 export async function issueManualStrike(actorId, {
   targetDiscordId,
   reason,
@@ -122,17 +71,14 @@ export async function issueManualStrike(actorId, {
     throw new ValidationError('A reason is required for a manual strike.');
   }
 
-  const user = await User.findOne({ discordId: targetDiscordId });
+  const user = await userRepo.findByDiscordId(targetDiscordId);
   if (!user) throw new NotFoundError('User', { discordId: targetDiscordId });
 
-  const strike = await Strike.create({
-    user: user._id,
-    discordId: user.discordId,
-    type: 'MANUAL',
-    quotaPeriodKey: null,
+  const strike = await strikeRepo.createManual({
+    userId: user.id,
+    discordId: user.discord_id,
     reason: reason.trim(),
     issuedBy: actorId,
-    status: 'ACTIVE',
   });
 
   await audit({
@@ -140,17 +86,17 @@ export async function issueManualStrike(actorId, {
     action: 'strike.manual_issued',
     category: 'STRIKE',
     targetType: 'Strike',
-    targetId: strike._id,
+    targetId: strike.id,
     after: {
-      userId: String(user._id),
-      discordId: user.discordId,
+      userId: String(user.id),
+      discordId: user.discord_id,
       type: 'MANUAL',
     },
     reason: reason.trim(),
   });
 
   logger.info(
-    { strikeId: String(strike._id), discordId: user.discordId, actorId },
+    { strikeId: strike.id, discordId: user.discord_id, actorId },
     'Manual strike issued'
   );
 
@@ -163,100 +109,95 @@ export async function issueManualStrike(actorId, {
 //  Removal / recovery
 // ============================================================
 
-/**
- * Cancel an ACTIVE strike manually.
- * Idempotent: cancelling a non-ACTIVE strike is a no-op.
- */
 export async function removeStrike(actorId, strikeId, { reason = null } = {}) {
-  const strike = await Strike.findById(strikeId);
-  if (!strike) throw new NotFoundError('Strike', { id: String(strikeId) });
-  if (strike.status !== 'ACTIVE') {
-    return { removed: false, strike: strike.toObject() };
+  const existing = await strikeRepo.findById(strikeId);
+  if (!existing) throw new NotFoundError('Strike', { id: String(strikeId) });
+
+  if (existing.status !== 'ACTIVE') {
+    return { removed: false, strike: existing };
   }
 
-  strike.status = 'CANCELLED';
-  strike.resolvedAt = new Date();
-  strike.resolvedBy = actorId;
-  strike.resolutionReason = reason;
-  await strike.save();
+  const updated = await strikeRepo.cancelAtomic(strikeId, {
+    resolvedBy: actorId,
+    reason,
+  });
+
+  if (!updated) {
+    const reloaded = await strikeRepo.findById(strikeId);
+    return { removed: false, strike: reloaded };
+  }
 
   await audit({
     actorId,
     action: 'strike.removed',
     category: 'STRIKE',
     targetType: 'Strike',
-    targetId: strike._id,
+    targetId: updated.id,
     before: { status: 'ACTIVE' },
     after: { status: 'CANCELLED' },
     reason,
   });
 
-  return { removed: true, strike: strike.toObject() };
+  return { removed: true, strike: updated };
 }
 
-/**
- * Manually recover a strike (per D7 this is usually done automatically
- * by quota evaluation, but High Command may also do it).
- * Idempotent: recovering a non-ACTIVE strike is a no-op.
- */
 export async function recoverStrike(actorId, strikeId, {
   reason = null,
   periodKey = null,
 } = {}) {
-  const strike = await Strike.findById(strikeId);
-  if (!strike) throw new NotFoundError('Strike', { id: String(strikeId) });
-  if (strike.status !== 'ACTIVE') {
-    return { recovered: false, strike: strike.toObject() };
+  const existing = await strikeRepo.findById(strikeId);
+  if (!existing) throw new NotFoundError('Strike', { id: String(strikeId) });
+
+  if (existing.status !== 'ACTIVE') {
+    return { recovered: false, strike: existing };
   }
 
-  strike.status = 'RECOVERED';
-  strike.resolvedAt = new Date();
-  strike.resolvedBy = actorId;
-  strike.resolutionReason = reason;
-  strike.recoveredInPeriodKey = periodKey;
-  await strike.save();
+  const updated = await strikeRepo.recoverAtomic(strikeId, {
+    resolvedBy: actorId,
+    reason,
+    periodKey,
+  });
+
+  if (!updated) {
+    const reloaded = await strikeRepo.findById(strikeId);
+    return { recovered: false, strike: reloaded };
+  }
 
   await audit({
     actorId,
     action: 'strike.recovered',
     category: 'STRIKE',
     targetType: 'Strike',
-    targetId: strike._id,
+    targetId: updated.id,
     before: { status: 'ACTIVE' },
     after: { status: 'RECOVERED', recoveredInPeriodKey: periodKey },
     reason,
   });
 
-  return { recovered: true, strike: strike.toObject() };
+  return { recovered: true, strike: updated };
 }
 
 /**
  * Reset all ACTIVE strikes for a user on rejoin (D10).
- * Sets status to CANCELLED with a distinct resolutionReason.
- * Never deletes rows — historical records preserved.
  */
 export async function resetStrikesOnRejoin(actorId, targetDiscordId) {
-  const user = await User.findOne({ discordId: targetDiscordId });
+  const user = await userRepo.findByDiscordId(targetDiscordId);
   if (!user) throw new NotFoundError('User', { discordId: targetDiscordId });
 
-  const active = await Strike.find({ user: user._id, status: 'ACTIVE' });
+  const active = await strikeRepo.listActiveForUser(targetDiscordId);
   if (active.length === 0) return { reset: 0 };
 
-  const now = new Date();
-  for (const strike of active) {
-    strike.status = 'CANCELLED';
-    strike.resolvedAt = now;
-    strike.resolvedBy = actorId;
-    strike.resolutionReason = 'rejoin reset (D10)';
-    await strike.save();
-  }
+  await strikeRepo.cancelAllActiveForUser(user.id, {
+    resolvedBy: actorId,
+    reason: 'rejoin reset (D10)',
+  });
 
   await audit({
     actorId,
     action: 'strike.reset_on_rejoin',
     category: 'STRIKE',
     targetType: 'User',
-    targetId: user._id,
+    targetId: user.id,
     before: { activeStrikes: active.length },
     after: { activeStrikes: 0 },
   });
@@ -270,41 +211,34 @@ export async function resetStrikesOnRejoin(actorId, targetDiscordId) {
 // ============================================================
 
 export async function getActiveStrikes(discordId) {
-  return Strike.find({ discordId, status: 'ACTIVE' })
-    .sort({ issuedAt: 1 })
-    .lean();
+  return strikeRepo.listActiveForUser(discordId);
 }
 
 export async function getStrikeHistory(discordId, { limit = 50 } = {}) {
-  return Strike.find({ discordId })
-    .sort({ issuedAt: -1 })
-    .limit(Math.min(200, Math.max(1, Number(limit) || 50)))
-    .lean();
+  return strikeRepo.historyForUser(discordId, { limit });
 }
 
 export async function countActiveStrikes(discordId) {
-  return Strike.countDocuments({ discordId, status: 'ACTIVE' });
+  return strikeRepo.countActiveForUser(discordId);
 }
 
 // ============================================================
 //  Threshold → removal request
 // ============================================================
 
-/**
- * After a strike is issued, check whether the user has reached the
- * threshold. If so, create a pending removal request.
- *
- * Idempotent via RemovalRequest's partial-unique index on
- * (user, status: 'PENDING').
- *
- * Imported lazily to avoid a circular dependency (removal service
- * imports strike service for the count).
- */
 async function checkThresholdAndCreateRemoval(user) {
-  const settings = await Settings.findOne({ key: 'global' }).lean();
-  const threshold = settings?.strikes?.removalThreshold ?? 3;
+  const thresholdRow = await settingsRepo.findByKey('strikes.removalThreshold');
+  let threshold = DEFAULT_THRESHOLD;
+  if (thresholdRow) {
+    try {
+      const parsed = JSON.parse(thresholdRow.value_json);
+      if (typeof parsed === 'number') threshold = parsed;
+    } catch {
+      // keep default
+    }
+  }
 
-  const activeCount = await Strike.countDocuments({ user: user._id, status: 'ACTIVE' });
+  const activeCount = await strikeRepo.countActiveForUser(user.discord_id);
   if (activeCount < threshold) return null;
 
   const { createFromThreshold } = await import('./removalRequest.service.js');
@@ -315,7 +249,7 @@ async function checkThresholdAndCreateRemoval(user) {
 
   if (result.created) {
     logger.info(
-      { discordId: user.discordId, activeCount, threshold },
+      { discordId: user.discord_id, activeCount, threshold },
       'Threshold reached — removal request created'
     );
   }

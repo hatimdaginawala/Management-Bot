@@ -6,7 +6,7 @@ import {
 } from 'discord.js';
 import * as attendanceService from '../../services/attendance.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { infoEmbed } from '../embedBuilders.js';
 import { paginate } from '../components/pagination.js';
@@ -86,10 +86,6 @@ export async function execute(interaction) {
   }
 }
 
-// ============================================================
-//  view
-// ============================================================
-
 async function handleView(interaction) {
   await assertPermission(interaction, 'attendance.view');
 
@@ -120,9 +116,9 @@ async function handleView(interaction) {
     renderPage: async (page) => {
       const pageResult = await attendanceService.listAttendance({ ...filters, page });
       const lines = pageResult.items.map((r) => {
-        const ts = Math.floor(new Date(r.eventAt).getTime() / 1000);
+        const ts = Math.floor(new Date(r.event_at).getTime() / 1000);
         const suffix = r.active ? '' : ' *(removed)*';
-        return '- `' + r.eventTypeKey + '` — <t:' + ts + ':R>' + suffix;
+        return '- `' + r.event_type_key + '` — <t:' + ts + ':R>' + suffix;
       });
       return infoEmbed({
         title: 'Attendance for ' + targetUser.username + ' (' + pageResult.total + ' total)',
@@ -131,10 +127,6 @@ async function handleView(interaction) {
     },
   });
 }
-
-// ============================================================
-//  history
-// ============================================================
 
 async function handleHistory(interaction) {
   await assertPermission(interaction, 'attendance.view');
@@ -156,10 +148,10 @@ async function handleHistory(interaction) {
   }
 
   const lines = records.map((r) => {
-    const ts = Math.floor(new Date(r.eventAt).getTime() / 1000);
+    const ts = Math.floor(new Date(r.event_at).getTime() / 1000);
     const emoji = r.active ? '🟢' : '🔴';
     const reason = r.reason ? ' — ' + r.reason : '';
-    return emoji + ' `' + r.eventTypeKey + '` — <t:' + ts + ':f>' + reason;
+    return emoji + ' `' + r.event_type_key + '` — <t:' + ts + ':f>' + reason;
   });
 
   const embed = infoEmbed({
@@ -173,10 +165,6 @@ async function handleHistory(interaction) {
 
   return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
-
-// ============================================================
-//  stats
-// ============================================================
 
 async function handleStats(interaction) {
   await assertPermission(interaction, 'attendance.view');
@@ -245,10 +233,6 @@ async function handleStats(interaction) {
   }
 }
 
-// ============================================================
-//  add / remove step flows
-// ============================================================
-
 async function startAddFlow(interaction) {
   await assertPermission(interaction, 'attendance.manage');
 
@@ -295,16 +279,12 @@ async function startRemoveFlow(interaction) {
   });
 }
 
-// ============================================================
-//  helpers
-// ============================================================
-
 async function assertPermission(interaction, permissionKey) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) {
     throw new AuthorizationError('You do not have permission to perform this action.');
   }
-  const ok = await permissionService.hasPermission(user._id, permissionKey);
+  const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) {
     throw new AuthorizationError('You do not have permission to perform this action.');
   }

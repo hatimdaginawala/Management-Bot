@@ -1,11 +1,19 @@
-import { QuotaPolicy } from '../models/index.js';
+import * as quotaPolicyRepo from '../db/repositories/quotaPolicy.repository.js';
 import { audit } from '../utils/audit.js';
 import {
   ValidationError,
   NotFoundError,
   ConflictError,
 } from '../utils/errors.js';
+import { db } from '../db/client.js';
 import logger from '../config/logger.js';
+
+/**
+ * Quota policy service. Public API unchanged.
+ *
+ * Setting a new policy closes the previous one and creates a new open
+ * one, inside a transaction so the two writes are atomic.
+ */
 
 const VALID_CATEGORIES = ['STAFF', 'LOW_RANK'];
 const DEFAULT_METRICS = {
@@ -13,41 +21,15 @@ const DEFAULT_METRICS = {
   LOW_RANK: 'ATTENDED_EVENTS',
 };
 
-/**
- * Quota policy service.
- *
- * Policies are versioned by `effectiveFrom` / `effectiveTo`:
- *   - The current open policy for a category has `effectiveTo: null`.
- *   - Setting a new policy closes the current one (`effectiveTo = now`)
- *     and creates a new one. Historical `QuotaPeriod.policies` snapshots
- *     are unaffected.
- *
- * A category may have exactly one "open" policy at a time — enforced by
- * a partial-unique index (`uniq_active_policy_per_category`).
- */
-
 export async function getActivePolicyForCategory(category) {
   assertCategory(category);
-  return QuotaPolicy.findOne({
-    category,
-    active: true,
-    effectiveTo: null,
-  }).lean();
+  return quotaPolicyRepo.findActiveForCategory(category);
 }
 
 export async function listPolicies({ category, includeExpired = true } = {}) {
-  const filter = {};
-  if (category) filter.category = category;
-  if (!includeExpired) filter.effectiveTo = null;
-  return QuotaPolicy.find(filter).sort({ category: 1, effectiveFrom: -1 }).lean();
+  return quotaPolicyRepo.list({ category, includeExpired });
 }
 
-/**
- * Set a new policy for a category.
- * Closes the current open policy (if any) and creates a new one.
- * Idempotent in spirit: calling with the same `amount` closes and
- * reopens; the semantics are "latest wins".
- */
 export async function setPolicy(actorId, {
   category,
   amount,
@@ -67,48 +49,33 @@ export async function setPolicy(actorId, {
   const metricValue = metric ?? DEFAULT_METRICS[category];
   const now = effectiveFrom ?? new Date();
 
-  // Close any existing open policy for this category.
-  const closed = await QuotaPolicy.findOneAndUpdate(
-    { category, active: true, effectiveTo: null },
-    { $set: { effectiveTo: now, active: false } },
-    { new: true }
-  );
+  const result = await db.transaction(async (trx) => {
+    // Close the current open policy, if any.
+    const closedId = await quotaPolicyRepo.closeOpenForCategory(category, now, trx);
 
-  // Create the new open policy.
-  let created;
-  try {
-    created = await QuotaPolicy.create({
+    // Create the new open policy.
+    const created = await quotaPolicyRepo.create({
       category,
       metric: metricValue,
       amount,
-      period: 'WEEKLY',
       effectiveFrom: now,
-      effectiveTo: null,
-      active: true,
       recoveryMultiplier,
       createdBy: actorId,
       notes,
-    });
-  } catch (err) {
-    if (err.code === 11000) {
-      throw new ConflictError(
-        'Another open policy for this category already exists. Retry.'
-      );
-    }
-    throw err;
-  }
+    }, trx);
+
+    return { closedId, created };
+  });
 
   await audit({
     actorId,
     action: 'quota.policy_set',
     category: 'QUOTA',
     targetType: 'QuotaPolicy',
-    targetId: created._id,
-    before: closed
-      ? { policyId: closed._id, amount: closed.amount, effectiveFrom: closed.effectiveFrom }
-      : null,
+    targetId: result.created.id,
+    before: result.closedId ? { policyId: result.closedId } : null,
     after: {
-      policyId: created._id,
+      policyId: result.created.id,
       category,
       amount,
       metric: metricValue,
@@ -117,21 +84,27 @@ export async function setPolicy(actorId, {
   });
 
   logger.info(
-    { actorId, category, amount, metric: metricValue, closedPolicyId: closed?._id },
+    {
+      actorId,
+      category,
+      amount,
+      metric: metricValue,
+      closedPolicyId: result.closedId,
+    },
     'Quota policy set'
   );
 
-  return created;
+  return result.created;
 }
 
 export async function getPolicyById(id) {
-  const p = await QuotaPolicy.findById(id).lean();
+  const p = await quotaPolicyRepo.findById(id);
   if (!p) throw new NotFoundError('Quota policy', { id: String(id) });
   return p;
 }
 
 function assertCategory(category) {
   if (!VALID_CATEGORIES.includes(category)) {
-    throw new ValidationError(`Invalid quota category: ${category}`);
+    throw new ValidationError('Invalid quota category: ' + category);
   }
 }

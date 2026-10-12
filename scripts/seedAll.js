@@ -1,8 +1,5 @@
-import { connectDatabase, disconnectDatabase } from '../src/config/database.js';
+import { connectDatabase, disconnectDatabase } from '../src/db/client.js';
 import logger from '../src/config/logger.js';
-
-// Register all Mongoose models before seeds run.
-import '../src/models/index.js';
 
 import { seedPermissions } from './seedPermissions.js';
 import { seedRoles } from './seedRoles.js';
@@ -15,10 +12,8 @@ async function main() {
 
   await connectDatabase();
 
-  // Order matters: roles reference permission keys, so permissions
-  // should exist first for any downstream UI to render. Settings has
-  // no dependencies but is seeded last so it can optionally read
-  // freshly seeded data in future phases.
+  // Order matters: permissions first (roles reference permission keys),
+  // then roles, event types, settings.
   await seedPermissions();
   await seedRoles();
   await seedEventTypes();

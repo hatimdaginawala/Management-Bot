@@ -1,27 +1,24 @@
 import { MessageFlags } from 'discord.js';
 import * as attendanceService from '../../services/attendance.service.js';
 import * as permissionService from '../../services/permission.service.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { successEmbed, errorEmbed } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
 import * as sessions from '../sessions.js';
 
 export const customId = 'modal:attendance-add';
 export const meta = {};
 
 export async function execute(interaction) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'attendance.manage');
+  const ok = await permissionService.hasPermission(user.id, 'attendance.manage');
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 
   const session = sessions.getSession('attendance:add', interaction.user.id);
   if (!session || !session.userId || !session.eventId) {
     return interaction.reply({
-      embeds: [errorEmbed({
-        title: 'Session Expired',
-        description: 'Please run `/attendance add` again.',
-      })],
+      embeds: [errorEmbed({ title: 'Session Expired', description: 'Please run `/attendance add` again.' })],
       flags: MessageFlags.Ephemeral,
     });
   }

@@ -4,7 +4,7 @@ import {
 } from 'discord.js';
 import * as auditService from '../../services/audit.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import { infoEmbed } from '../embedBuilders.js';
 import { paginate } from '../components/pagination.js';
@@ -16,46 +16,26 @@ export const data = new SlashCommandBuilder()
     sub
       .setName('view')
       .setDescription('View audit log entries with filters.')
-      .addStringOption((opt) =>
-        opt.setName('actor').setDescription('Filter by actor Discord ID or "system"')
-      )
-      .addStringOption((opt) =>
-        opt.setName('category').setDescription('Filter by category (e.g. ROLE, EVENT)')
-      )
-      .addStringOption((opt) =>
-        opt.setName('action').setDescription('Filter by exact action key')
-      )
-      .addStringOption((opt) =>
-        opt.setName('targettype').setDescription('Filter by target type (e.g. Role, User, Event)')
-      )
-      .addStringOption((opt) =>
-        opt.setName('targetid').setDescription('Filter by target ObjectId')
-      )
-      .addStringOption((opt) =>
-        opt.setName('from').setDescription('Start date (YYYY-MM-DD)')
-      )
-      .addStringOption((opt) =>
-        opt.setName('to').setDescription('End date (YYYY-MM-DD)')
-      )
+      .addStringOption((opt) => opt.setName('actor').setDescription('Filter by actor Discord ID or "system"'))
+      .addStringOption((opt) => opt.setName('category').setDescription('Filter by category'))
+      .addStringOption((opt) => opt.setName('action').setDescription('Filter by exact action key'))
+      .addStringOption((opt) => opt.setName('targettype').setDescription('Filter by target type'))
+      .addStringOption((opt) => opt.setName('targetid').setDescription('Filter by target ID'))
+      .addStringOption((opt) => opt.setName('from').setDescription('Start date (YYYY-MM-DD)'))
+      .addStringOption((opt) => opt.setName('to').setDescription('End date (YYYY-MM-DD)'))
   )
   .addSubcommand((sub) =>
     sub
       .setName('summary')
       .setDescription('Aggregated audit log summary.')
-      .addStringOption((opt) =>
-        opt.setName('from').setDescription('Start date (YYYY-MM-DD)')
-      )
-      .addStringOption((opt) =>
-        opt.setName('to').setDescription('End date (YYYY-MM-DD)')
-      )
+      .addStringOption((opt) => opt.setName('from').setDescription('Start date (YYYY-MM-DD)'))
+      .addStringOption((opt) => opt.setName('to').setDescription('End date (YYYY-MM-DD)'))
   )
   .addSubcommand((sub) =>
     sub
       .setName('entry')
       .setDescription('View a single audit log entry.')
-      .addStringOption((opt) =>
-        opt.setName('id').setDescription('Entry ObjectId').setRequired(true)
-      )
+      .addStringOption((opt) => opt.setName('id').setDescription('Entry ID').setRequired(true))
   )
   .toJSON();
 
@@ -73,10 +53,6 @@ export async function execute(interaction) {
       throw new Error('Unknown /audit subcommand: ' + sub);
   }
 }
-
-// ============================================================
-//  view
-// ============================================================
 
 async function handleView(interaction) {
   const filter = {};
@@ -100,10 +76,7 @@ async function handleView(interaction) {
 
   if (first.total === 0) {
     return interaction.reply({
-      embeds: [infoEmbed({
-        title: 'No Entries',
-        description: 'No audit log entries match those filters.',
-      })],
+      embeds: [infoEmbed({ title: 'No Entries', description: 'No audit log entries match those filters.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -115,10 +88,9 @@ async function handleView(interaction) {
     renderPage: async (page) => {
       const result = await auditService.queryLogs({ ...filter, page, pageSize: 10 });
       const lines = result.items.map((e) => {
-        const ts = Math.floor(new Date(e.createdAt).getTime() / 1000);
-        const target = e.targetType + (e.targetId ? ':' + String(e.targetId).slice(-6) : '');
-        return '• <t:' + ts + ':R> `' + e.category + '` **' + e.action + '** by `' +
-               e.actorId + '` → ' + target;
+        const ts = Math.floor(new Date(e.created_at).getTime() / 1000);
+        const target = e.target_type + (e.target_id ? ':' + String(e.target_id).slice(-6) : '');
+        return '• <t:' + ts + ':R> `' + e.category + '` **' + e.action + '** by `' + e.actor_id + '` → ' + target;
       });
       return infoEmbed({
         title: 'Audit Log (' + result.total + ' total)',
@@ -127,10 +99,6 @@ async function handleView(interaction) {
     },
   });
 }
-
-// ============================================================
-//  summary
-// ============================================================
 
 async function handleSummary(interaction) {
   const fromRaw = interaction.options.getString('from');
@@ -143,28 +111,14 @@ async function handleSummary(interaction) {
 
   if (summary.total === 0) {
     return interaction.reply({
-      embeds: [infoEmbed({
-        title: 'No Activity',
-        description: 'No audit entries in that window.',
-      })],
+      embeds: [infoEmbed({ title: 'No Activity', description: 'No audit entries in that window.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
 
-  const byCategory = summary.byCategory
-    .slice(0, 10)
-    .map((c) => '**' + c.category + ':** ' + c.count)
-    .join('\n');
-
-  const byAction = summary.byAction
-    .slice(0, 10)
-    .map((a) => '`' + a.action + '` — ' + a.count)
-    .join('\n');
-
-  const byActor = summary.byActor
-    .slice(0, 10)
-    .map((a) => '`' + a.actorId + '` — ' + a.count)
-    .join('\n');
+  const byCategory = summary.byCategory.slice(0, 10).map((c) => '**' + c.category + ':** ' + c.count).join('\n');
+  const byAction = summary.byAction.slice(0, 10).map((a) => '`' + a.action + '` — ' + a.count).join('\n');
+  const byActor = summary.byActor.slice(0, 10).map((a) => '`' + a.actorId + '` — ' + a.count).join('\n');
 
   return interaction.reply({
     embeds: [infoEmbed({
@@ -180,37 +134,25 @@ async function handleSummary(interaction) {
   });
 }
 
-// ============================================================
-//  entry
-// ============================================================
-
 async function handleEntry(interaction) {
   const id = interaction.options.getString('id', true);
   const entry = await auditService.getEntry(id);
 
-  const ts = Math.floor(new Date(entry.createdAt).getTime() / 1000);
+  const ts = Math.floor(new Date(entry.created_at).getTime() / 1000);
 
   const fields = [
-    { name: 'Actor', value: '`' + entry.actorId + '`', inline: true },
+    { name: 'Actor', value: '`' + entry.actor_id + '`', inline: true },
     { name: 'Category', value: '`' + entry.category + '`', inline: true },
     { name: 'Action', value: '`' + entry.action + '`', inline: true },
-    { name: 'Target', value: entry.targetType + (entry.targetId ? ':' + entry.targetId : ''), inline: false },
+    { name: 'Target', value: entry.target_type + (entry.target_id ? ':' + entry.target_id : ''), inline: false },
     { name: 'When', value: '<t:' + ts + ':f>', inline: false },
   ];
 
-  if (entry.before) {
-    fields.push({
-      name: 'Before',
-      value: '```json\n' + safeJson(entry.before) + '\n```',
-      inline: false,
-    });
+  if (entry.before_json) {
+    fields.push({ name: 'Before', value: '```json\n' + safeJson(entry.before_json) + '\n```', inline: false });
   }
-  if (entry.after) {
-    fields.push({
-      name: 'After',
-      value: '```json\n' + safeJson(entry.after) + '\n```',
-      inline: false,
-    });
+  if (entry.after_json) {
+    fields.push({ name: 'After', value: '```json\n' + safeJson(entry.after_json) + '\n```', inline: false });
   }
   if (entry.reason) {
     fields.push({ name: 'Reason', value: entry.reason, inline: false });
@@ -218,23 +160,17 @@ async function handleEntry(interaction) {
 
   return interaction.reply({
     embeds: [infoEmbed({
-      title: 'Audit Entry `' + String(entry._id).slice(-8) + '`',
+      title: 'Audit Entry `' + String(entry.id) + '`',
       fields,
     })],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-// ============================================================
-//  helpers
-// ============================================================
-
 function parseDate(raw, label) {
   const iso = raw.length === 10 ? raw + 'T00:00:00.000Z' : raw;
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) {
-    throw new ValidationError(label + ' must be a valid date.');
-  }
+  if (Number.isNaN(d.getTime())) throw new ValidationError(label + ' must be a valid date.');
   return d;
 }
 
@@ -248,12 +184,8 @@ function safeJson(obj) {
 }
 
 async function assertPermission(interaction, permissionKey) {
-  const user = await User.findOne({ discordId: interaction.user.id });
-  if (!user) {
-    throw new AuthorizationError('You do not have permission to perform this action.');
-  }
-  const ok = await permissionService.hasPermission(user._id, permissionKey);
-  if (!ok) {
-    throw new AuthorizationError('You do not have permission to perform this action.');
-  }
+  const user = await userRepo.findByDiscordId(interaction.user.id);
+  if (!user) throw new AuthorizationError('You do not have permission to perform this action.');
+  const ok = await permissionService.hasPermission(user.id, permissionKey);
+  if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }

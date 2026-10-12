@@ -5,25 +5,25 @@ import {
   TextInputStyle,
   MessageFlags,
 } from 'discord.js';
-import { infoEmbed, successEmbed } from '../embedBuilders.js';
-import * as sessions from '../sessions.js';
 import * as settingsService from '../../services/settings.service.js';
 import * as permissionService from '../../services/permission.service.js';
-import { User } from '../../models/index.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
+import { infoEmbed, successEmbed } from '../embedBuilders.js';
+import * as sessions from '../sessions.js';
 import { SETTINGS_META, formatSettingValue } from '../../constants/settingsMeta.js';
 
 export const customId = ['settings:set:setting', 'settings:reset:setting'];
 export const meta = {};
 
 export async function execute(interaction) {
-  const kind = interaction.customId.split(':')[1]; // set | reset
+  const kind = interaction.customId.split(':')[1];
   const path = interaction.values[0];
   const flowKind = 'settings:' + kind;
 
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'settings.manage');
+  const ok = await permissionService.hasPermission(user.id, 'settings.manage');
   if (!ok) throw new AuthorizationError('You do not have permission to change settings.');
 
   const session = sessions.getSession(flowKind, interaction.user.id);
@@ -65,7 +65,6 @@ export async function execute(interaction) {
     }
   }
 
-  // kind === 'set' — open a modal pre-filled with the current value.
   sessions.updateSession(flowKind, interaction.user.id, { path, step: 'value' });
 
   const current = await settingsService.getSetting(path);
@@ -101,7 +100,7 @@ export async function execute(interaction) {
 function placeholderFor(format) {
   switch (format) {
     case 'boolean':         return 'true or false';
-    case 'channel':         return 'Discord channel ID (e.g. 1234567890123456789)';
+    case 'channel':         return 'Discord channel ID';
     case 'number:minutes':  return 'e.g. 15';
     case 'number:days':     return 'e.g. 7';
     case 'number:count':    return 'e.g. 3';

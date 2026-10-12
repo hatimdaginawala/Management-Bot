@@ -1,4 +1,5 @@
-import { Notice, User } from '../models/index.js';
+import * as noticeRepo from '../db/repositories/notice.repository.js';
+import * as userRepo from '../db/repositories/user.repository.js';
 import { audit } from '../utils/audit.js';
 import {
   ValidationError,
@@ -7,21 +8,7 @@ import {
 import logger from '../config/logger.js';
 
 /**
- * Notice service.
- *
- * Notices are informational records attached to a user. Types:
- *   INACTIVITY      - user flagged inactive; optionally grants quota exemption
- *   WARNING         - administrative warning
- *   ADMINISTRATIVE  - general admin notice
- *   OTHER           - catch-all
- *
- * Lifecycle:
- *   ACTIVE  → EXPIRED (when endAt passes, via Phase 17 job)
- *           → CANCELLED (manual, by an authorized user)
- *
- * Notices are NOT unique per user — a user can have multiple active
- * notices simultaneously. For example, an INACTIVITY notice and a
- * separate WARNING can coexist.
+ * Notice service. Public API unchanged.
  */
 
 const VALID_TYPES = ['INACTIVITY', 'WARNING', 'ADMINISTRATIVE', 'OTHER'];
@@ -41,13 +28,13 @@ export async function createNotice(actorId, {
 } = {}) {
   if (!targetDiscordId) throw new ValidationError('targetDiscordId is required.');
   if (!type || !VALID_TYPES.includes(type)) {
-    throw new ValidationError(`type must be one of: ${VALID_TYPES.join(', ')}`);
+    throw new ValidationError('type must be one of: ' + VALID_TYPES.join(', '));
   }
   if (!reason || reason.trim().length < 3) {
     throw new ValidationError('A reason is required (min 3 characters).');
   }
 
-  const user = await User.findOne({ discordId: targetDiscordId });
+  const user = await userRepo.findByDiscordId(targetDiscordId);
   if (!user) throw new NotFoundError('User', { discordId: targetDiscordId });
 
   const start = startAt ? new Date(startAt) : new Date();
@@ -62,16 +49,13 @@ export async function createNotice(actorId, {
     throw new ValidationError('endAt must be after startAt.');
   }
 
-  // Default exemption behavior: INACTIVITY grants exemption by default,
-  // all others do not. Caller may override.
-  const grants =
-    grantsQuotaExemption === null
-      ? type === 'INACTIVITY'
-      : Boolean(grantsQuotaExemption);
+  const grants = grantsQuotaExemption === null
+    ? type === 'INACTIVITY'
+    : Boolean(grantsQuotaExemption);
 
-  const notice = await Notice.create({
-    user: user._id,
-    discordId: user.discordId,
+  const notice = await noticeRepo.create({
+    userId: user.id,
+    discordId: user.discord_id,
     type,
     reason: reason.trim(),
     startAt: start,
@@ -87,7 +71,7 @@ export async function createNotice(actorId, {
     action: 'notice.created',
     category: 'NOTICE',
     targetType: 'Notice',
-    targetId: notice._id,
+    targetId: notice.id,
     after: {
       discordId: targetDiscordId,
       type,
@@ -98,10 +82,10 @@ export async function createNotice(actorId, {
   });
 
   logger.info(
-    { noticeId: String(notice._id), discordId: targetDiscordId, type },
+    { noticeId: notice.id, discordId: targetDiscordId, type },
     'Notice created'
   );
-  return notice.toObject();
+  return notice;
 }
 
 // ============================================================
@@ -109,23 +93,15 @@ export async function createNotice(actorId, {
 // ============================================================
 
 export async function cancelNotice(actorId, noticeId, { reason = null } = {}) {
-  const notice = await Notice.findOneAndUpdate(
-    { _id: noticeId, status: 'ACTIVE' },
-    {
-      $set: {
-        status: 'CANCELLED',
-        cancelledBy: actorId,
-        cancelledAt: new Date(),
-        cancellationReason: reason,
-      },
-    },
-    { new: true }
-  );
+  const notice = await noticeRepo.cancelAtomic(noticeId, {
+    cancelledBy: actorId,
+    reason,
+  });
 
   if (!notice) {
-    const existing = await Notice.findById(noticeId);
+    const existing = await noticeRepo.findById(noticeId);
     if (!existing) throw new NotFoundError('Notice', { id: String(noticeId) });
-    return { cancelled: false, notice: existing.toObject() };
+    return { cancelled: false, notice: existing };
   }
 
   await audit({
@@ -133,36 +109,22 @@ export async function cancelNotice(actorId, noticeId, { reason = null } = {}) {
     action: 'notice.cancelled',
     category: 'NOTICE',
     targetType: 'Notice',
-    targetId: notice._id,
+    targetId: notice.id,
     after: { status: 'CANCELLED' },
     reason,
   });
 
-  return { cancelled: true, notice: notice.toObject() };
+  return { cancelled: true, notice };
 }
 
 // ============================================================
-//  Expiry (job helper)
+//  Expiry
 // ============================================================
 
-/**
- * Mark all ACTIVE notices whose endAt has passed as EXPIRED.
- * Notices with `endAt: null` are open-ended and remain ACTIVE.
- * Idempotent.
- */
 export async function expireNotices({ asOf = new Date() } = {}) {
-  const result = await Notice.updateMany(
-    {
-      status: 'ACTIVE',
-      endAt: { $ne: null, $lte: asOf },
-    },
-    { $set: { status: 'EXPIRED', expiredAt: asOf } }
-  );
-  const count = result.modifiedCount ?? 0;
-  if (count > 0) {
-    logger.info({ count }, 'Notices expired');
-  }
-  return count;
+  const affected = await noticeRepo.expireDue(asOf);
+  if (affected > 0) logger.info({ count: affected }, 'Notices expired');
+  return affected;
 }
 
 // ============================================================
@@ -170,7 +132,7 @@ export async function expireNotices({ asOf = new Date() } = {}) {
 // ============================================================
 
 export async function getNoticeById(noticeId) {
-  const notice = await Notice.findById(noticeId).lean();
+  const notice = await noticeRepo.findById(noticeId);
   if (!notice) throw new NotFoundError('Notice', { id: String(noticeId) });
   return notice;
 }
@@ -184,17 +146,8 @@ export async function listNotices({
 } = {}) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 25));
-  const skip = (page - 1) * pageSize;
 
-  const filter = {};
-  if (status && status !== 'ANY') filter.status = status;
-  if (discordId) filter.discordId = discordId;
-  if (type) filter.type = type;
-
-  const [items, total] = await Promise.all([
-    Notice.find(filter).sort({ startAt: -1 }).skip(skip).limit(pageSize).lean(),
-    Notice.countDocuments(filter),
-  ]);
+  const { items, total } = await noticeRepo.list({ status, discordId, type, page, pageSize });
 
   return {
     items,
@@ -206,22 +159,111 @@ export async function listNotices({
 }
 
 export async function getActiveNoticesForUser(discordId) {
-  return Notice.find({ discordId, status: 'ACTIVE' })
-    .sort({ startAt: -1 })
-    .lean();
+  return noticeRepo.listActiveForDiscordId(discordId);
 }
 
-/**
- * Does the user have an ACTIVE quota-exempting notice right now?
- * Used as a defense-in-depth exemption check.
- */
 export async function hasActiveExemptNotice(userObjectId, asOf = new Date()) {
-  const notice = await Notice.findOne({
-    user: userObjectId,
-    status: 'ACTIVE',
-    grantsQuotaExemption: true,
-    startAt: { $lte: asOf },
-    $or: [{ endAt: null }, { endAt: { $gte: asOf } }],
-  }).lean();
-  return Boolean(notice);
+  return noticeRepo.hasActiveExempt(userObjectId, asOf);
+}
+
+// ============================================================
+//  Extension flow
+// ============================================================
+
+export async function requestExtension(discordId, noticeId, {
+  newEndAt,
+  reason,
+}) {
+  const notice = await noticeRepo.findById(noticeId);
+  if (!notice) throw new NotFoundError('Notice', { id: String(noticeId) });
+  if (notice.discord_id !== discordId) {
+    throw new ValidationError('You can only extend your own notices.');
+  }
+  if (notice.status !== 'ACTIVE') {
+    throw new ValidationError('That notice is no longer active.');
+  }
+  if (notice.pending_extension_status === 'PENDING') {
+    throw new ValidationError('You already have a pending extension request for this notice.');
+  }
+
+  const newEnd = new Date(newEndAt);
+  if (Number.isNaN(newEnd.getTime())) {
+    throw new ValidationError('New end date must be valid.');
+  }
+  if (newEnd <= new Date()) {
+    throw new ValidationError('New end date must be in the future.');
+  }
+  if (!reason || reason.trim().length < 3) {
+    throw new ValidationError('A reason is required.');
+  }
+
+  const updated = await noticeRepo.setPendingExtension(notice.id, {
+    requestedBy: discordId,
+    newEndAt: newEnd,
+    reason: reason.trim(),
+  });
+
+  await audit({
+    actorId: discordId,
+    action: 'notice.extension_requested',
+    category: 'NOTICE',
+    targetType: 'Notice',
+    targetId: notice.id,
+    after: { newEndAt: newEnd, reason: reason.trim() },
+  });
+
+  return updated;
+}
+
+export async function listPendingExtensions({ limit = 25 } = {}) {
+  return noticeRepo.findPendingExtensions({ limit });
+}
+
+export async function approveExtension(actorId, noticeId, { reviewReason = null } = {}) {
+  const notice = await noticeRepo.approveExtensionAtomic(noticeId, {
+    reviewedBy: actorId,
+    reviewReason,
+  });
+  if (!notice) {
+    const existing = await noticeRepo.findById(noticeId);
+    if (!existing) throw new NotFoundError('Notice', { id: String(noticeId) });
+    throw new ValidationError('Notice has no pending extension.');
+  }
+
+  await audit({
+    actorId,
+    action: 'notice.extension_approved',
+    category: 'NOTICE',
+    targetType: 'Notice',
+    targetId: notice.id,
+    after: { newEndAt: notice.end_at },
+  });
+
+  return notice;
+}
+
+export async function rejectExtension(actorId, noticeId, { reviewReason } = {}) {
+  if (!reviewReason || reviewReason.trim().length < 3) {
+    throw new ValidationError('A review reason is required.');
+  }
+  const notice = await noticeRepo.rejectExtensionAtomic(noticeId, {
+    reviewedBy: actorId,
+    reviewReason: reviewReason.trim(),
+  });
+  if (!notice) {
+    const existing = await noticeRepo.findById(noticeId);
+    if (!existing) throw new NotFoundError('Notice', { id: String(noticeId) });
+    throw new ValidationError('Notice has no pending extension.');
+  }
+
+  await audit({
+    actorId,
+    action: 'notice.extension_rejected',
+    category: 'NOTICE',
+    targetType: 'Notice',
+    targetId: notice.id,
+    reason: reviewReason.trim(),
+  });
+
+  return notice;
 }

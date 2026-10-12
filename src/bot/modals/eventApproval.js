@@ -11,8 +11,7 @@ import * as permissionService from '../../services/permission.service.js';
 import * as settingsService from '../../services/settings.service.js';
 import { successEmbed, errorEmbed, infoEmbed, COLORS } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
-import logger from '../../config/logger.js';
+import * as userRepo from '../../db/repositories/user.repository.js';import logger from '../../config/logger.js';
 
 export const customId = ['event:approve:*', 'event:reject:*'];
 export const meta = {};

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { isDatabaseHealthy } from '../config/database.js';
+import { isDatabaseHealthy } from '../db/client.js';
 import { APP_NAME, APP_VERSION } from '../config/constants.js';
 
 const router = Router();

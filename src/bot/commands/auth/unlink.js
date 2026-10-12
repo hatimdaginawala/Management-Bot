@@ -12,19 +12,17 @@ export const meta = {
 };
 
 export async function execute(interaction) {
-  const user = await verificationService.unlinkSelf(interaction.user.id);
+  await verificationService.unlinkSelf(interaction.user.id);
 
   const embed = warningEmbed({
     title: 'Account Unlinked',
     description:
       'Your Discord account is no longer linked to a Roblox account. ' +
-      'You can re-link after 7 days (see below).',
+      'You can re-link after 7 days.',
     fields: [
       {
         name: 'Cooldown',
-        value:
-          'You can run `/link` again after 7 days. ' +
-          'This prevents account trading.',
+        value: 'Run `/link` again after 7 days. This prevents account trading.',
         inline: false,
       },
     ],

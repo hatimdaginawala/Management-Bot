@@ -5,11 +5,10 @@ import {
   TextInputStyle,
   MessageFlags,
 } from 'discord.js';
-import * as removalRequestService from '../../services/removalRequest.service.js';
 import * as permissionService from '../../services/permission.service.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { errorEmbed } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
 import * as sessions from '../sessions.js';
 
 export const customId = ['removal:approve:*', 'removal:dismiss:*'];
@@ -29,9 +28,9 @@ export async function execute(interaction) {
 }
 
 async function handleApprove(interaction, requestId) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'removal.approve');
+  const ok = await permissionService.hasPermission(user.id, 'removal.approve');
   if (!ok) throw new AuthorizationError('You do not have permission to approve removals.');
 
   sessions.startSession('removal:approve', interaction.user.id, { requestId });
@@ -64,9 +63,9 @@ async function handleApprove(interaction, requestId) {
 }
 
 async function handleDismiss(interaction, requestId) {
-  const user = await User.findOne({ discordId: interaction.user.id });
+  const user = await userRepo.findByDiscordId(interaction.user.id);
   if (!user) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(user._id, 'removal.dismiss');
+  const ok = await permissionService.hasPermission(user.id, 'removal.dismiss');
   if (!ok) throw new AuthorizationError('You do not have permission to dismiss removals.');
 
   sessions.startSession('removal:dismiss', interaction.user.id, { requestId });
@@ -89,6 +88,6 @@ async function handleDismiss(interaction, requestId) {
 }
 
 function parseAction(customId) {
-  const m = /^removal:(approve|dismiss):([a-f0-9]{24})$/.exec(customId);
+  const m = /^removal:(approve|dismiss):(\d+)$/.exec(customId);
   return m ? { kind: m[1], requestId: m[2] } : null;
 }

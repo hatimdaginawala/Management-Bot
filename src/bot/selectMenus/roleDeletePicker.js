@@ -2,21 +2,20 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  MessageFlags,
 } from 'discord.js';
 import * as roleService from '../../services/role.service.js';
 import * as permissionService from '../../services/permission.service.js';
+import * as userRepo from '../../db/repositories/user.repository.js';
 import { infoEmbed, warningEmbed } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
-import { User } from '../../models/index.js';
 
 export const customId = 'role:delete:role';
 export const meta = {};
 
 export async function execute(interaction) {
-  const actor = await User.findOne({ discordId: interaction.user.id });
+  const actor = await userRepo.findByDiscordId(interaction.user.id);
   if (!actor) throw new AuthorizationError('You do not have permission.');
-  const ok = await permissionService.hasPermission(actor._id, 'roles.delete');
+  const ok = await permissionService.hasPermission(actor.id, 'roles.delete');
   if (!ok) throw new AuthorizationError('You do not have permission to delete roles.');
 
   const roleKey = interaction.values[0];
