@@ -25,22 +25,21 @@ export async function showEventPicker(interaction, {
       CANCELLED: '⚫',
     }[e.status] || '⚪';
 
-    const hostName = e.host?.discordUsername || 'unknown host';
-    const loggedAgo = formatRelative(e.createdAt);
+    const hostName = e.host_discord_username || 'unknown host';
+    const loggedAgo = formatRelative(e.created_at);
+    const attendeeCount = (e.attendeeEntries || []).length;
 
-    // Label: "🟡 patrol — 3 attendees"
     const label = truncatePlain(
-      statusEmoji + ' ' + e.eventTypeKey + ' — ' + e.attendeeEntries.length + ' attendees',
+      statusEmoji + ' ' + e.event_type_key + ' — ' + attendeeCount + ' attendees',
       100
     );
 
-    // Description: "by @host · logged 2 hours ago · APPROVED"
     const description = truncatePlain(
       'by @' + hostName + ' · logged ' + loggedAgo + ' · ' + e.status,
       100
     );
 
-    return { label, description, value: String(e._id) };
+    return { label, description, value: String(e.id) };
   });
 
   const menu = new StringSelectMenuBuilder()
@@ -76,12 +75,14 @@ export async function showEventPicker(interaction, {
  * act on a picked event.
  */
 export function formatEventSummary(event) {
-  const ts = Math.floor(new Date(event.createdAt).getTime() / 1000);
+  const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
+  const attendeeCount = (event.attendeeEntries || []).length;
+
   return [
-    '**' + event.eventTypeKey + '**',
-    'Host: <@' + event.host.discordId + '>',
+    '**' + event.event_type_key + '**',
+    'Host: <@' + event.host_discord_id + '>',
     'Created: <t:' + ts + ':R>',
-    'Attendees: ' + event.attendeeEntries.length,
+    'Attendees: ' + attendeeCount,
     'Status: `' + event.status + '`',
   ].join('\n');
 }
