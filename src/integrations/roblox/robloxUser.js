@@ -5,36 +5,54 @@ const BASE = 'https://users.roblox.com/v1';
 
 /**
  * Look up a Roblox user by exact username.
- * Returns { id, name, displayName, description, created, ... } or null.
  *
- * Roblox's `username` search is exact-match on this endpoint.
- * For fuzzy matching we'd use `/v1/usernames/users` with a POST body,
- * but exact is what we want here — the user typed a username.
+ * Prefers the /usernames/users POST endpoint, which is the dedicated
+ * exact-match lookup and has higher rate limits than /users/search.
+ * Falls back to search only if the primary returns no data.
  */
 export async function getUserByUsername(username) {
-  const data = await robloxGet(`${BASE}/users/search?keyword=${encodeURIComponent(username)}&limit=10`);
+  // Primary: exact-match POST endpoint.
+  try {
+    const exact = await robloxPost(`${BASE}/usernames/users`, {
+      usernames: [username],
+      excludeBannedUsers: false,
+    });
+    const match = (exact?.data ?? [])[0];
+    if (match) {
+      return {
+        id: match.id,
+        name: match.name,
+        displayName: match.displayName,
+        previousUsernames: match.previousUsernames ?? [],
+        hasVerifiedBadge: match.hasVerifiedBadge ?? false,
+        isBanned: false,
+      };
+    }
+  } catch (err) {
+    logger.debug(
+      { username, err: err.message },
+      'Exact-match lookup failed, falling back to search'
+    );
+  }
+
+  // Fallback: search endpoint with strict exact filter.
+  const data = await robloxGet(
+    `${BASE}/users/search?keyword=${encodeURIComponent(username)}&limit=10`
+  );
   if (!data || data.__notFound) return null;
 
-  // `users/search` returns paginated `{ data: [...] }`.
   const exact = (data.data ?? []).find(
     (u) => u.name.toLowerCase() === username.toLowerCase()
   );
   return exact ?? null;
 }
 
-/**
- * Fetch a Roblox user by numeric ID.
- */
 export async function getUserById(robloxId) {
   const data = await robloxGet(`${BASE}/users/${robloxId}`);
   if (!data || data.__notFound) return null;
   return data;
 }
 
-/**
- * Fetch the full profile including the About field (`description`).
- * This is what verification reads.
- */
 export async function getUserProfile(robloxId) {
   const data = await robloxGet(`${BASE}/users/${robloxId}`);
   if (!data || data.__notFound) return null;
@@ -48,10 +66,6 @@ export async function getUserProfile(robloxId) {
   };
 }
 
-/**
- * Batch resolve usernames → user objects.
- * Roblox supports up to 100 per request.
- */
 export async function getUsersByUsernames(usernames) {
   if (!usernames.length) return [];
   const chunks = [];
@@ -70,29 +84,66 @@ export async function getUsersByUsernames(usernames) {
 }
 
 /**
- * POST variant for the username batch endpoint.
- * Kept private to this module.
+ * POST with retries on 429 and 5xx. Uses a browser-like User-Agent
+ * because Roblox's CDN rejects some non-browser clients.
  */
 async function robloxPost(url, body) {
-  // We don't use the GET client here; write a minimal POST that mirrors
-  // the retry policy.
   const { default: axios } = await import('axios');
   const client = axios.create({
     timeout: 10_000,
     headers: {
-      'User-Agent': 'guard24-bot/1.0 (+https://github.com/24th-guard-rifles)',
+      'User-Agent':
+        'Mozilla/5.0 (compatible; guard24-bot/1.0; +https://github.com/24th-guard-rifles)',
       Accept: 'application/json',
       'Content-Type': 'application/json',
     },
     validateStatus: () => true,
   });
-  const res = await client.post(url, body);
-  if (res.status === 200) return res.data;
-  if (res.status === 429) {
-    const wait = parseInt(res.headers['retry-after'] ?? '2', 10) * 1000;
-    await new Promise((r) => setTimeout(r, wait));
-    return robloxPost(url, body);
+
+  let lastErr = null;
+  const maxRetries = 3;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await client.post(url, body);
+
+      if (res.status === 200) return res.data;
+
+      if (res.status === 429) {
+        // Honour Retry-After if present, else exponential backoff.
+        const retryAfter = parseInt(res.headers['retry-after'] ?? '0', 10);
+        const wait = retryAfter > 0 ? retryAfter * 1000 : 1000 * Math.pow(2, attempt);
+        logger.warn(
+          { url, attempt, wait },
+          'Roblox POST rate-limited, retrying'
+        );
+        await new Promise((r) => setTimeout(r, wait));
+        lastErr = new Error('Rate limited');
+        continue;
+      }
+
+      if (res.status >= 500 && attempt < maxRetries) {
+        const wait = 1000 * Math.pow(2, attempt);
+        logger.warn(
+          { url, status: res.status, attempt, wait },
+          'Roblox POST 5xx, retrying'
+        );
+        await new Promise((r) => setTimeout(r, wait));
+        lastErr = new Error('Server error ' + res.status);
+        continue;
+      }
+
+      logger.warn({ url, status: res.status }, 'Roblox POST failed');
+      return null;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        continue;
+      }
+      break;
+    }
   }
-  logger.warn({ url, status: res.status }, 'Roblox POST failed');
-  return null;
+
+  throw lastErr ?? new Error('Roblox POST exhausted retries');
 }

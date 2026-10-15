@@ -1,4 +1,10 @@
-import { SlashCommandBuilder, MessageFlags } from 'discord.js';
+import {
+  SlashCommandBuilder,
+  MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} from 'discord.js';
 import * as verificationService from '../../../services/verification.service.js';
 import { infoEmbed } from '../../embedBuilders.js';
 import logger from '../../../config/logger.js';
@@ -38,7 +44,7 @@ export async function execute(interaction) {
     '',
     '      `' + verification.code + '`',
     '',
-    '**3.** Save your profile, then run `/verify` here.',
+    '**3.** Save your profile, then click the button below.',
     '',
     '**This code expires in 30 minutes.** If it expires, run `/link` again.',
   ].join('\n');
@@ -55,7 +61,19 @@ export async function execute(interaction) {
     ],
   });
 
-  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('link:verify:' + verification.id)
+      .setLabel('Verify My Account')
+      .setStyle(ButtonStyle.Success)
+
+  );
+
+  await interaction.reply({
+    embeds: [embed],
+    components: [row],
+    flags: MessageFlags.Ephemeral,
+  });
 
   try {
     await interaction.user.send({ embeds: [embed] });

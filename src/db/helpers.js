@@ -7,38 +7,44 @@ import {
 import logger from '../config/logger.js';
 
 /**
- * Shared helpers used by every repository.
+ * Columns that hold BIGINT UNSIGNED IDs and should be returned as
+ * JavaScript numbers. Everything else (including discord_id and
+ * roblox_id) stays as a string.
  *
- * Responsibilities:
- *   - Convert MySQL row shapes to plain JS objects with correct types
- *   - Translate MySQL error codes to AppError subclasses
- *   - Wrap queries in a consistent error boundary
+ * Only add to this list if the column is defined as BIGINT UNSIGNED
+ * in the migration.
  */
+const NUMERIC_ID_COLUMNS = new Set([
+  // Primary keys
+  'id',
 
-// ============================================================
-//  Row conversion
-// ============================================================
+  // Foreign keys referencing primary keys
+  'user_id',
+  'role_id',
+  'event_id',
+  'period_id',
+  'policy_id',
+  'quota_period_id',
+  'sync_log_id',
+  'resolved_user_id',
+  'host_user_id',
+  'event_type_id',
+]);
 
 /**
- * MySQL returns BIGINT as strings (to avoid precision loss for values
- * above 2^53). Our IDs stay well below that, so we safely convert.
- *
- * Same for TINYINT(1) booleans: MySQL returns 0/1, we convert to
- * real booleans.
- *
- * JSON columns are already parsed by mysql2.
- *
- * The `booleanFields` and `jsonFields` params let each repository
- * declare which columns need conversion.
+ * Columns that are BOOLEAN (TINYINT(1)) but which repositories don't
+ * always list explicitly. Repositories still pass booleanFields for
+ * clarity; this is only a fallback.
  */
+const AUTO_BOOLEAN_SUFFIXES = [];
+
 export function convertRow(row, { booleanFields = [], jsonFields = [] } = {}) {
   if (!row) return null;
   const out = { ...row };
 
-  // ID fields → Number
-  if (out.id !== undefined && out.id !== null) out.id = Number(out.id);
+  // Numeric IDs → Number
   for (const key of Object.keys(out)) {
-    if (key.endsWith('_id') && out[key] !== null && out[key] !== undefined) {
+    if (NUMERIC_ID_COLUMNS.has(key) && out[key] !== null && out[key] !== undefined) {
       out[key] = Number(out[key]);
     }
   }
@@ -63,6 +69,8 @@ export function convertRow(row, { booleanFields = [], jsonFields = [] } = {}) {
 
   return out;
 }
+
+
 
 /**
  * Convert an array of rows.

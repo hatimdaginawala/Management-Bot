@@ -1,8 +1,9 @@
 import { MessageFlags } from 'discord.js';
 import * as eventService from '../../services/event.service.js';
+import * as attendanceService from '../../services/attendance.service.js';
 import * as permissionService from '../../services/permission.service.js';
 import * as userRepo from '../../db/repositories/user.repository.js';
-import { successEmbed, errorEmbed, infoEmbed } from '../embedBuilders.js';
+import { successEmbed, errorEmbed, infoEmbed, truncate } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { formatEventSummary } from '../components/eventPicker.js';
 
@@ -27,15 +28,40 @@ export async function execute(interaction) {
 async function handleView(interaction, eventId) {
   await requirePermission(interaction, 'events.view');
   const event = await eventService.getEvent(eventId);
+  const attendanceCount = await attendanceService.countAttendanceForEvent(event.id);
+
+  const statusEmoji = {
+    PENDING: '🟡',
+    APPROVED: '🟢',
+    REJECTED: '🔴',
+    CANCELLED: '⚫',
+  }[event.status] || '⚪';
+
+  const fields = [
+    { name: 'Status', value: statusEmoji + ' `' + event.status + '`', inline: true },
+    { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
+    { name: 'Host', value: '<@' + event.host_discord_id + '>', inline: true },
+    { name: 'Attendees', value: String((event.attendeeEntries || []).length) + ' listed, ' + String(attendanceCount) + ' credited', inline: false },
+    { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
+  ];
+
+  if (event.notes) {
+    fields.push({ name: 'Notes', value: truncate(event.notes, 500), inline: false });
+  }
+  if (event.rejection_reason) {
+    fields.push({ name: 'Rejection Reason', value: truncate(event.rejection_reason, 500), inline: false });
+  }
+  if (event.cancellation_reason) {
+    fields.push({ name: 'Cancellation Reason', value: truncate(event.cancellation_reason, 500), inline: false });
+  }
+
+  const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
 
   await interaction.update({
     embeds: [infoEmbed({
       title: 'Event Details',
-      description: formatEventSummary(event),
-      fields: [
-        { name: 'Proof', value: event.proof_url, inline: false },
-        ...(event.notes ? [{ name: 'Notes', value: event.notes, inline: false }] : []),
-      ],
+      description: 'Created <t:' + ts + ':R>',
+      fields,
     })],
     components: [],
   });

@@ -42,19 +42,21 @@ export async function execute(interaction) {
     });
   }
 
-  // Build plain-text descriptions — no <t:...> or IDs.
   const options = result.items.map((e) => {
-    const hostName = e.host.discordUsername || 'unknown host';
-    const loggedAgo = formatRelative(e.createdAt);
-    const shortType = e.eventTypeKey;
+    const hostName = e.host_discord_username || 'unknown host';
+    const loggedAgo = formatRelative(e.created_at);
+    const attendeeCount = (e.attendeeEntries || []).length;
 
-    // Label: "patrol — 3 attendees"
-    const label = truncatePlain(shortType + ' — ' + e.attendeeEntries.length + ' attendees', 100);
+    const label = truncatePlain(
+      e.event_type_key + ' — ' + attendeeCount + ' attendees',
+      100
+    );
+    const description = truncatePlain(
+      'by @' + hostName + ' · logged ' + loggedAgo,
+      100
+    );
 
-    // Description: "by @host · logged 2 hours ago"
-    const description = truncatePlain('by @' + hostName + ' · logged ' + loggedAgo, 100);
-
-    return { label, description, value: String(e._id) };
+    return { label, description, value: String(e.id) };
   });
 
   const menu = new StringSelectMenuBuilder()

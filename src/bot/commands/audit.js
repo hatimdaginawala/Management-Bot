@@ -8,6 +8,7 @@ import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import { infoEmbed } from '../embedBuilders.js';
 import { paginate } from '../components/pagination.js';
+import { formatAuditLine, renderActor, renderTarget, compactTime } from '../utils/auditFormat.js';
 
 export const data = new SlashCommandBuilder()
   .setName('audit')
@@ -87,11 +88,7 @@ async function handleView(interaction) {
     totalPages: first.totalPages,
     renderPage: async (page) => {
       const result = await auditService.queryLogs({ ...filter, page, pageSize: 10 });
-      const lines = result.items.map((e) => {
-        const ts = Math.floor(new Date(e.created_at).getTime() / 1000);
-        const target = e.target_type + (e.target_id ? ':' + String(e.target_id).slice(-6) : '');
-        return '• <t:' + ts + ':R> `' + e.category + '` **' + e.action + '** by `' + e.actor_id + '` → ' + target;
-      });
+      const lines = result.items.map(formatAuditLine);
       return infoEmbed({
         title: 'Audit Log (' + result.total + ' total)',
         description: lines.join('\n'),
@@ -116,9 +113,12 @@ async function handleSummary(interaction) {
     });
   }
 
-  const byCategory = summary.byCategory.slice(0, 10).map((c) => '**' + c.category + ':** ' + c.count).join('\n');
-  const byAction = summary.byAction.slice(0, 10).map((a) => '`' + a.action + '` — ' + a.count).join('\n');
-  const byActor = summary.byActor.slice(0, 10).map((a) => '`' + a.actorId + '` — ' + a.count).join('\n');
+  const byCategory = summary.byCategory.slice(0, 10)
+    .map((c) => '**' + c.category + ':** ' + c.count).join('\n');
+  const byAction = summary.byAction.slice(0, 10)
+    .map((a) => '`' + a.action + '` — ' + a.count).join('\n');
+  const byActor = summary.byActor.slice(0, 10)
+    .map((a) => renderActor(a.actorId) + ' — ' + a.count).join('\n');
 
   return interaction.reply({
     embeds: [infoEmbed({
@@ -138,14 +138,12 @@ async function handleEntry(interaction) {
   const id = interaction.options.getString('id', true);
   const entry = await auditService.getEntry(id);
 
-  const ts = Math.floor(new Date(entry.created_at).getTime() / 1000);
-
   const fields = [
-    { name: 'Actor', value: '`' + entry.actor_id + '`', inline: true },
+    { name: 'Actor', value: renderActor(entry.actor_id), inline: true },
     { name: 'Category', value: '`' + entry.category + '`', inline: true },
     { name: 'Action', value: '`' + entry.action + '`', inline: true },
-    { name: 'Target', value: entry.target_type + (entry.target_id ? ':' + entry.target_id : ''), inline: false },
-    { name: 'When', value: '<t:' + ts + ':f>', inline: false },
+    { name: 'Target', value: renderTarget(entry.target_type, entry.target_id), inline: false },
+    { name: 'When', value: compactTime(entry.created_at), inline: false },
   ];
 
   if (entry.before_json) {
@@ -160,7 +158,7 @@ async function handleEntry(interaction) {
 
   return interaction.reply({
     embeds: [infoEmbed({
-      title: 'Audit Entry `' + String(entry.id) + '`',
+      title: 'Audit Entry `' + entry.id + '`',
       fields,
     })],
     flags: MessageFlags.Ephemeral,
