@@ -1,3 +1,5 @@
+// src/bot/commands/strike.js
+
 import {
   SlashCommandBuilder,
   UserSelectMenuBuilder,
@@ -14,52 +16,39 @@ import { infoEmbed } from '../embedBuilders.js';
 import { paginate } from '../components/pagination.js';
 import * as sessions from '../sessions.js';
 import { resolveUsernames, formatRelative, truncatePlain } from '../utils/format.js';
+import { openMenuForModule, replyOrUpdate } from '../menus/render.js';
 
 export const data = new SlashCommandBuilder()
   .setName('strike')
   .setDescription('Strike management, recovery, and removal requests.')
-  .addSubcommand((sub) =>
-    sub.setName('view').setDescription('Show active strikes for a user.')
-      .addUserOption((opt) => opt.setName('user').setDescription('Target user').setRequired(true))
-  )
-  .addSubcommand((sub) =>
-    sub.setName('history').setDescription('Full strike history for a user.')
-      .addUserOption((opt) => opt.setName('user').setDescription('Target user').setRequired(true))
-      .addIntegerOption((opt) => opt.setName('limit').setDescription('How many records (max 100)').setMinValue(1).setMaxValue(100))
-  )
-  .addSubcommand((sub) => sub.setName('issue').setDescription('Issue a manual strike to a user.'))
-  .addSubcommand((sub) => sub.setName('remove').setDescription('Remove an active strike.'))
-  .addSubcommand((sub) => sub.setName('recover').setDescription('Mark an active strike as recovered.'))
-  .addSubcommand((sub) => sub.setName('pending-removals').setDescription('List pending removal requests.'))
-  .addSubcommand((sub) => sub.setName('approve-removal').setDescription('Approve a pending removal request.'))
-  .addSubcommand((sub) => sub.setName('dismiss-removal').setDescription('Dismiss a pending removal request.'))
   .toJSON();
 
 export const meta = {};
 
-export async function execute(interaction) {
-  const sub = interaction.options.getSubcommand(true);
-  switch (sub) {
-    case 'view':              return handleView(interaction);
-    case 'history':           return handleHistory(interaction);
-    case 'issue':             return startIssueFlow(interaction);
-    case 'remove':            return startRemoveFlow(interaction);
-    case 'recover':           return startRecoverFlow(interaction);
-    case 'pending-removals':  return handlePendingRemovals(interaction);
-    case 'approve-removal':   return startApproveRemovalFlow(interaction);
-    case 'dismiss-removal':   return startDismissRemovalFlow(interaction);
-    default:
-      throw new Error('Unknown /strike subcommand: ' + sub);
-  }
+export async function execute(interaction, ctx) {
+  return openMenuForModule(interaction, ctx, 'strike');
 }
 
-async function handleView(interaction) {
+async function handleView(interaction, ctx, params = {}) {
   await assertPermission(interaction, 'strikes.view');
-  const target = interaction.options.getUser('user', true);
-  const active = await strikeService.getActiveStrikes(target.id);
+  const target = params.user ?? interaction.options?.getUser?.('user');
 
+  if (!target) {
+    return replyOrUpdate(interaction, {
+      embeds: [infoEmbed({ title: 'Pick a User', description: 'Select a user to view strikes for.' })],
+      components: [new ActionRowBuilder().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId('strike:pick-user:view')
+          .setPlaceholder('Select a user')
+          .setMinValues(1).setMaxValues(1)
+      )],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const active = await strikeService.getActiveStrikes(target.id);
   if (active.length === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'No Active Strikes', description: '<@' + target.id + '> has no active strikes.' })],
       flags: MessageFlags.Ephemeral,
     });
@@ -71,7 +60,7 @@ async function handleView(interaction) {
     return '• `' + s.type + '`' + period + ' — <t:' + ts + ':R> — ' + s.reason;
   });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Active Strikes for ' + target.username,
       description: lines.join('\n'),
@@ -81,14 +70,27 @@ async function handleView(interaction) {
   });
 }
 
-async function handleHistory(interaction) {
+async function handleHistory(interaction, ctx, params = {}) {
   await assertPermission(interaction, 'strikes.view');
-  const target = interaction.options.getUser('user', true);
-  const limit = interaction.options.getInteger('limit') || 50;
-  const all = await strikeService.getStrikeHistory(target.id, { limit });
+  const target = params.user ?? interaction.options?.getUser?.('user');
+  const limit = params.limit ?? interaction.options?.getInteger?.('limit') ?? 50;
 
+  if (!target) {
+    return replyOrUpdate(interaction, {
+      embeds: [infoEmbed({ title: 'Pick a User', description: 'Select a user to view strike history for.' })],
+      components: [new ActionRowBuilder().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId('strike:pick-user:history')
+          .setPlaceholder('Select a user')
+          .setMinValues(1).setMaxValues(1)
+      )],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const all = await strikeService.getStrikeHistory(target.id, { limit });
   if (all.length === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'No Strike History', description: '<@' + target.id + '> has no strike history.' })],
       flags: MessageFlags.Ephemeral,
     });
@@ -101,7 +103,7 @@ async function handleHistory(interaction) {
     return emoji + ' `' + s.type + '`' + period + ' — <t:' + ts + ':R>';
   });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Strike History for ' + target.username,
       description: lines.join('\n'),
@@ -110,9 +112,8 @@ async function handleHistory(interaction) {
   });
 }
 
-async function startIssueFlow(interaction) {
+async function startIssueFlow(interaction, ctx) {
   await assertPermission(interaction, 'strikes.issue');
-
   sessions.startSession('strike:issue', interaction.user.id, { step: 'user' });
 
   const menu = new UserSelectMenuBuilder()
@@ -120,16 +121,14 @@ async function startIssueFlow(interaction) {
     .setPlaceholder('Select the user to strike')
     .setMinValues(1).setMaxValues(1);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Issue Strike — Step 1 of 2', description: 'Select the Discord user you want to issue a strike to.' })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function startRemoveFlow(interaction) {
+async function startRemoveFlow(interaction, ctx) {
   await assertPermission(interaction, 'strikes.remove');
 
   const menu = new UserSelectMenuBuilder()
@@ -137,16 +136,14 @@ async function startRemoveFlow(interaction) {
     .setPlaceholder('Select the user whose strike you want to remove')
     .setMinValues(1).setMaxValues(1);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Remove Strike — Step 1 of 2', description: 'Select the user.' })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function startRecoverFlow(interaction) {
+async function startRecoverFlow(interaction, ctx) {
   await assertPermission(interaction, 'strikes.remove');
 
   const menu = new UserSelectMenuBuilder()
@@ -154,28 +151,27 @@ async function startRecoverFlow(interaction) {
     .setPlaceholder('Select the user whose strike you want to recover')
     .setMinValues(1).setMaxValues(1);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Recover Strike — Step 1 of 2', description: 'Select the user.' })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handlePendingRemovals(interaction) {
+async function handlePendingRemovals(interaction, ctx) {
   await assertPermission(interaction, 'removal.view');
 
   const result = await removalRequestService.listPendingRemovals({ page: 1, pageSize: 10 });
-
   if (result.total === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'No Pending Removals', description: 'There are no pending removal requests.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  }
 
   await paginate(interaction, {
     totalPages: result.totalPages,
@@ -195,43 +191,35 @@ async function handlePendingRemovals(interaction) {
   });
 }
 
-async function startApproveRemovalFlow(interaction) {
+async function startApproveRemovalFlow(interaction, ctx) {
   await assertPermission(interaction, 'removal.approve');
   return showRemovalPicker(interaction, 'removal:approve:request', 'Approve Removal');
 }
 
-async function startDismissRemovalFlow(interaction) {
+async function startDismissRemovalFlow(interaction, ctx) {
   await assertPermission(interaction, 'removal.dismiss');
   return showRemovalPicker(interaction, 'removal:dismiss:request', 'Dismiss Removal');
 }
 
 async function showRemovalPicker(interaction, customId, title) {
   const pending = await removalRequestService.listPendingRemovals({ page: 1, pageSize: 25 });
-
   if (pending.total === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'No Pending Removals', description: 'There are no pending removal requests.' })],
       flags: MessageFlags.Ephemeral,
     });
   }
 
-  const usernames = await resolveUsernames(
-    interaction.client,
-    pending.items.map((r) => r.discord_id)
-  );
-
+  const usernames = await resolveUsernames(interaction.client, pending.items.map((r) => r.discord_id));
   const options = pending.items.map((r) => {
     const username = usernames.get(r.discord_id) || 'unknown user';
     const reason = r.description || r.reason || 'no reason';
     const ageAgo = formatRelative(r.created_at);
-
-    const label = truncatePlain('@' + username, 100);
-    const description = truncatePlain(
-      r.strike_count + '/' + r.strike_threshold + ' strikes · ' + ageAgo + ' · ' + reason,
-      100
-    );
-
-    return { label, description, value: String(r.id) };
+    return {
+      label: truncatePlain('@' + username, 100),
+      description: truncatePlain(r.strike_count + '/' + r.strike_threshold + ' strikes · ' + ageAgo + ' · ' + reason, 100),
+      value: String(r.id),
+    };
   });
 
   const menu = new StringSelectMenuBuilder()
@@ -239,14 +227,9 @@ async function showRemovalPicker(interaction, customId, title) {
     .setPlaceholder('Select a pending removal')
     .setMinValues(1).setMaxValues(1).addOptions(options);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
-    embeds: [infoEmbed({
-      title,
-      description: '**' + pending.total + '** pending removal request(s).',
-    })],
-    components: [row],
+  return replyOrUpdate(interaction, {
+    embeds: [infoEmbed({ title, description: '**' + pending.total + '** pending removal request(s).' })],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -257,3 +240,14 @@ async function assertPermission(interaction, permissionKey) {
   const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }
+
+export const HANDLERS = {
+  view: handleView,
+  history: handleHistory,
+  issue: startIssueFlow,
+  remove: startRemoveFlow,
+  recover: startRecoverFlow,
+  'pending-removals': handlePendingRemovals,
+  'approve-removal': startApproveRemovalFlow,
+  'dismiss-removal': startDismissRemovalFlow,
+};

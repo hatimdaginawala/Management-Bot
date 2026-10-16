@@ -1,3 +1,5 @@
+// src/bot/permissionGuard.js
+
 import { MessageFlags } from 'discord.js';
 import * as userRepo from '../db/repositories/user.repository.js';
 import * as permissionService from '../services/permission.service.js';
@@ -19,8 +21,7 @@ export async function guard(interaction, meta, handler) {
 
   let user = await userRepo.findByDiscordId(discordId);
 
-  // Auto-create a User row on first interaction. Every Discord user
-  // who talks to the bot should have a local user record.
+  // Auto-create a User row on first interaction.
   if (!user) {
     try {
       user = await userRepo.create({
@@ -33,7 +34,6 @@ export async function guard(interaction, meta, handler) {
         'Auto-created User row'
       );
     } catch (err) {
-      // Duplicate key from a race — reload.
       user = await userRepo.findByDiscordId(discordId);
       if (!user) {
         logger.warn(
@@ -47,7 +47,7 @@ export async function guard(interaction, meta, handler) {
   if (meta?.requireLinked && (!user || !user.roblox_id)) {
     await safeReply(interaction, errorEmbed({
       title: 'Account Not Linked',
-      description: 'You must link your Roblox account first. Use `/auth link <roblox_username>` to begin.',
+      description: 'You must link your Roblox account first. Use `/link <roblox_username>` to begin.',
     }));
     return;
   }
@@ -60,16 +60,25 @@ export async function guard(interaction, meta, handler) {
     return;
   }
 
-  if (meta?.permission) {
-    if (!user) {
-      await safeReply(interaction, errorEmbed({
-        title: 'Permission Denied',
-        description: 'You do not have permission to perform this action.',
-      }));
-      return;
+  // ------------------------------------------------------------------
+  // Resolve the user's effective permissions ONCE per interaction.
+  // The `permissions` Set is shared with every downstream handler via ctx.
+  // ------------------------------------------------------------------
+  let permissions = new Set();
+  if (user) {
+    try {
+      permissions = await permissionService.getEffectivePermissions(user.id);
+    } catch (err) {
+      logger.warn(
+        { err: err.message, discordId },
+        'Could not resolve effective permissions — falling back to empty set'
+      );
     }
-    const allowed = await permissionService.hasPermission(user.id, meta.permission);
-    if (!allowed) {
+  }
+
+  // Legacy meta.permission check (still supported).
+  if (meta?.permission) {
+    if (!user || !permissions.has(meta.permission)) {
       logger.debug(
         { discordId, permission: meta.permission, command: interaction.commandName ?? interaction.customId },
         'Permission denied'
@@ -101,7 +110,11 @@ export async function guard(interaction, meta, handler) {
   }
 
   try {
-    await handler({ user });
+    await handler({
+      user,
+      permissions,
+      hasPermission: (key) => permissions.has(key),
+    });
   } catch (err) {
     logger.error(
       {

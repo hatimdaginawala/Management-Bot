@@ -109,19 +109,38 @@ export function findSelect(customId) {
 }
 
 function findIn(map, customId) {
+  // 1. Exact match.
   if (map.has(customId)) return map.get(customId);
 
-  // Prefix match: registered key ending in ":*"
+  // 2. Segment-based wildcard match.
+  //    A registered key with `*` segments matches an incoming customId
+  //    if both have the same number of `:`-separated segments and every
+  //    non-`*` segment matches exactly. Longest (most specific) wins.
+  const incoming = customId.split(':');
   let bestMatch = null;
-  let bestPrefixLen = -1;
+  let bestScore = -1;
+
   for (const [key, mod] of map.entries()) {
-    if (!key.endsWith(':*')) continue;
-    const prefix = key.slice(0, -1); // keep trailing ":"
-    if (customId.startsWith(prefix) && prefix.length > bestPrefixLen) {
+    if (!key.includes('*')) continue;
+    const pattern = key.split(':');
+    if (pattern.length !== incoming.length) continue;
+
+    let ok = true;
+    let wildcards = 0;
+    for (let i = 0; i < pattern.length; i++) {
+      if (pattern[i] === '*') { wildcards++; continue; }
+      if (pattern[i] !== incoming[i]) { ok = false; break; }
+    }
+    if (!ok) continue;
+
+    // Prefer the pattern with fewer wildcards (more specific).
+    const score = pattern.length - wildcards;
+    if (score > bestScore) {
+      bestScore = score;
       bestMatch = mod;
-      bestPrefixLen = prefix.length;
     }
   }
+
   return bestMatch;
 }
 

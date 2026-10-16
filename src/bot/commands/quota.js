@@ -1,9 +1,8 @@
+// src/bot/commands/quota.js
+
 import {
   SlashCommandBuilder,
-  ModalBuilder,
   ActionRowBuilder,
-  TextInputBuilder,
-  TextInputStyle,
   UserSelectMenuBuilder,
   MessageFlags,
 } from 'discord.js';
@@ -15,53 +14,23 @@ import * as quotaResultRepo from '../../db/repositories/quotaResult.repository.j
 import { AuthorizationError } from '../../utils/errors.js';
 import { infoEmbed, warningEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
+import { openMenuForModule, replyOrUpdate } from '../menus/render.js';
 
 export const data = new SlashCommandBuilder()
   .setName('quota')
   .setDescription('Weekly quota policies, exemptions, and status.')
-  .addSubcommand((sub) =>
-    sub.setName('view').setDescription('View the active quota policy for a category.')
-      .addStringOption((opt) =>
-        opt.setName('category').setDescription('Quota category')
-          .addChoices(
-            { name: 'Staff (hosted events)', value: 'STAFF' },
-            { name: 'Low Rank (attended events)', value: 'LOW_RANK' }
-          )
-      )
-  )
-  .addSubcommand((sub) => sub.setName('status').setDescription('Show the current quota period and policy snapshot.'))
-  .addSubcommand((sub) =>
-    sub.setName('history').setDescription('Show recent weekly quota results for a user.')
-      .addUserOption((opt) => opt.setName('user').setDescription('Target user (default: yourself)'))
-      .addIntegerOption((opt) =>
-        opt.setName('limit').setDescription('How many weeks (max 20)').setMinValue(1).setMaxValue(20)
-      )
-  )
-  .addSubcommand((sub) => sub.setName('set').setDescription('Set the quota policy for a category.'))
-  .addSubcommand((sub) => sub.setName('exempt').setDescription('Grant a quota exemption to a user.'))
-  .addSubcommand((sub) => sub.setName('unexempt').setDescription('Revoke a quota exemption from a user.'))
   .toJSON();
 
 export const meta = {};
 
-export async function execute(interaction) {
-  const sub = interaction.options.getSubcommand(true);
-  switch (sub) {
-    case 'view':     return handleView(interaction);
-    case 'status':   return handleStatus(interaction);
-    case 'history':  return handleHistory(interaction);
-    case 'set':      return handleSet(interaction);
-    case 'exempt':   return startExemptFlow(interaction);
-    case 'unexempt': return startUnexemptFlow(interaction);
-    default:
-      throw new Error('Unknown /quota subcommand: ' + sub);
-  }
+export async function execute(interaction, ctx) {
+  return openMenuForModule(interaction, ctx, 'quota');
 }
 
-async function handleView(interaction) {
+async function handleView(interaction, ctx, params = {}) {
   await assertPermission(interaction, 'quota.view');
 
-  const requested = interaction.options.getString('category');
+  const requested = params.category ?? interaction.options?.getString?.('category');
   const categories = requested ? [requested] : ['STAFF', 'LOW_RANK'];
 
   const fields = [];
@@ -83,7 +52,7 @@ async function handleView(interaction) {
     });
   }
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Active Quota Policies',
       description: 'Current configuration for each category.',
@@ -93,13 +62,12 @@ async function handleView(interaction) {
   });
 }
 
-async function handleStatus(interaction) {
+async function handleStatus(interaction, ctx) {
   await assertPermission(interaction, 'quota.view');
 
   const period = await quotaPeriodService.getCurrentPeriod();
-
   if (!period) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [warningEmbed({
         title: 'No Open Period',
         description: 'There is no currently OPEN quota period.',
@@ -121,13 +89,17 @@ async function handleStatus(interaction) {
     for (const p of period.policies) {
       fields.push({
         name: p.category + ' policy',
-        value: ['Metric: `' + p.metric + '`', 'Required: **' + p.amount + '**', 'Recovery: `' + p.recoveryMultiplier + 'x`'].join('\n'),
+        value: [
+          'Metric: `' + p.metric + '`',
+          'Required: **' + p.amount + '**',
+          'Recovery: `' + p.recoveryMultiplier + 'x`',
+        ].join('\n'),
         inline: true,
       });
     }
   }
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Quota Period Status',
       description: 'Started <t:' + start + ':R>',
@@ -137,25 +109,30 @@ async function handleStatus(interaction) {
   });
 }
 
-async function handleHistory(interaction) {
+async function handleHistory(interaction, ctx, params = {}) {
   await assertPermission(interaction, 'quota.view');
 
-  const target = interaction.options.getUser('user') || interaction.user;
-  const limit = interaction.options.getInteger('limit') || 8;
+  const target = params.user ?? interaction.options?.getUser?.('user') ?? interaction.user;
+  const limit = params.limit ?? interaction.options?.getInteger?.('limit') ?? 8;
 
   const user = await userRepo.findByDiscordId(target.id);
   if (!user) {
-    return interaction.reply({
-      embeds: [infoEmbed({ title: 'User Not Registered', description: '<@' + target.id + '> is not registered.' })],
+    return replyOrUpdate(interaction, {
+      embeds: [infoEmbed({
+        title: 'User Not Registered',
+        description: '<@' + target.id + '> is not registered.',
+      })],
       flags: MessageFlags.Ephemeral,
     });
   }
 
   const results = await quotaResultRepo.recentForUser(user.id, { limit });
-
   if (results.length === 0) {
-    return interaction.reply({
-      embeds: [infoEmbed({ title: 'No Quota History', description: '<@' + target.id + '> has no recorded quota results.' })],
+    return replyOrUpdate(interaction, {
+      embeds: [infoEmbed({
+        title: 'No Quota History',
+        description: '<@' + target.id + '> has no recorded quota results.',
+      })],
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -163,12 +140,13 @@ async function handleHistory(interaction) {
   const lines = results.map((r) => {
     const emoji = { MET: '🟢', MISSED: '🔴', EXEMPT: '⚪', SKIPPED: '⬛' }[r.status] || '⚪';
     const progress = (r.status === 'MET' || r.status === 'MISSED')
-      ? ' (' + r.actual_amount + '/' + r.required_amount + ')' : '';
+      ? ' (' + r.actual_amount + '/' + r.required_amount + ')'
+      : '';
     const exempt = r.exempt_reason ? ' — *' + r.exempt_reason + '*' : '';
     return emoji + ' `' + r.period_key + '` — **' + r.category + '** · ' + r.status + progress + exempt;
   });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Quota History — ' + target.username,
       description: lines.join('\n'),
@@ -177,46 +155,8 @@ async function handleHistory(interaction) {
   });
 }
 
-async function handleSet(interaction) {
-  await assertPermission(interaction, 'quota.manage');
-
-  const modal = new ModalBuilder()
-    .setCustomId('modal:quota-set')
-    .setTitle('Set Quota Policy');
-
-  const categoryInput = new TextInputBuilder()
-    .setCustomId('category').setLabel('Category')
-    .setPlaceholder('STAFF or LOW_RANK')
-    .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10);
-
-  const amountInput = new TextInputBuilder()
-    .setCustomId('amount').setLabel('Required amount per week')
-    .setPlaceholder('e.g. 5')
-    .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3);
-
-  const recoveryInput = new TextInputBuilder()
-    .setCustomId('recoveryMultiplier').setLabel('Recovery multiplier (default 2)')
-    .setPlaceholder('2')
-    .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2);
-
-  const notesInput = new TextInputBuilder()
-    .setCustomId('notes').setLabel('Notes (optional)')
-    .setPlaceholder('Reason for change')
-    .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500);
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(categoryInput),
-    new ActionRowBuilder().addComponents(amountInput),
-    new ActionRowBuilder().addComponents(recoveryInput),
-    new ActionRowBuilder().addComponents(notesInput)
-  );
-
-  return interaction.showModal(modal);
-}
-
-async function startExemptFlow(interaction) {
+async function startExemptFlow(interaction, ctx) {
   await assertPermission(interaction, 'quota.exempt');
-
   sessions.startSession('quota:exempt', interaction.user.id, { step: 'user' });
 
   const menu = new UserSelectMenuBuilder()
@@ -224,19 +164,17 @@ async function startExemptFlow(interaction) {
     .setPlaceholder('Select the user to exempt')
     .setMinValues(1).setMaxValues(1);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Grant Quota Exemption — Step 1 of 2',
       description: 'Select the user you want to exempt from weekly quota.',
     })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function startUnexemptFlow(interaction) {
+async function startUnexemptFlow(interaction, ctx) {
   await assertPermission(interaction, 'quota.exempt');
 
   const menu = new UserSelectMenuBuilder()
@@ -244,14 +182,12 @@ async function startUnexemptFlow(interaction) {
     .setPlaceholder('Select the user to unexempt')
     .setMinValues(1).setMaxValues(1);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Revoke Quota Exemption',
       description: 'Select the user whose exemption you want to revoke.',
     })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -262,3 +198,11 @@ async function assertPermission(interaction, permissionKey) {
   const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }
+
+export const HANDLERS = {
+  view: handleView,
+  status: handleStatus,
+  history: handleHistory,
+  exempt: startExemptFlow,
+  unexempt: startUnexemptFlow,
+};

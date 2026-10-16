@@ -4,7 +4,6 @@ import * as permissionService from '../../services/permission.service.js';
 import { successEmbed, errorEmbed, COLORS } from '../embedBuilders.js';
 import { AuthorizationError, ValidationError } from '../../utils/errors.js';
 import * as userRepo from '../../db/repositories/user.repository.js';
-import { dmHost } from '../buttons/eventApproval.js';
 
 export const customId = 'modal:event-reject:*';
 export const meta = {};
@@ -26,7 +25,10 @@ export async function execute(interaction) {
   const reason = interaction.fields.getTextInputValue('reason').trim();
   if (reason.length < 3) throw new ValidationError('Reason must be at least 3 characters.');
 
-  const event = await eventService.rejectEvent(interaction.user.id, eventId, { reason });
+  const event = await eventService.rejectEvent(interaction.user.id, eventId, {
+    reason,
+    client: interaction.client,
+  });
 
   try {
     const originalEmbed = interaction.message?.embeds?.[0];
@@ -38,14 +40,6 @@ export async function execute(interaction) {
       await interaction.message.edit({ embeds: [updated], components: [] });
     }
   } catch {}
-
-  await dmHost(interaction.client, event, {
-    title: 'Event Rejected',
-    color: COLORS.ERROR,
-    approverId: interaction.user.id,
-    reason,
-    extraLine: 'Your event was rejected. Contact High Command if you believe this is an error.',
-  });
 
   const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
 

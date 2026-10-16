@@ -1,5 +1,9 @@
+// src/bot/commands/stats.js
+
 import {
   SlashCommandBuilder,
+  ActionRowBuilder,
+  UserSelectMenuBuilder,
   MessageFlags,
 } from 'discord.js';
 import * as statisticsService from '../../services/statistics.service.js';
@@ -7,60 +11,20 @@ import * as permissionService from '../../services/permission.service.js';
 import * as userRepo from '../../db/repositories/user.repository.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import { infoEmbed } from '../embedBuilders.js';
+import { openMenuForModule, replyOrUpdate } from '../menus/render.js';
 
 export const data = new SlashCommandBuilder()
   .setName('stats')
   .setDescription('Group statistics and analytics.')
-  .addSubcommand((sub) => sub.setName('daily').setDescription('Daily summary.'))
-  .addSubcommand((sub) => sub.setName('weekly').setDescription('Weekly summary.'))
-  .addSubcommand((sub) => sub.setName('monthly').setDescription('Monthly summary.'))
-  .addSubcommand((sub) =>
-    sub.setName('user').setDescription('Per-user dashboard.')
-      .addUserOption((opt) => opt.setName('user').setDescription('Target user (default: yourself)'))
-  )
-  .addSubcommand((sub) => sub.setName('events').setDescription('Event statistics.'))
-  .addSubcommand((sub) => sub.setName('attendance').setDescription('Attendance statistics.'))
-  .addSubcommand((sub) => sub.setName('hosts').setDescription('Top event hosts.'))
-  .addSubcommand((sub) =>
-    sub.setName('attendees').setDescription('Top attendees leaderboard.')
-      .addStringOption((opt) =>
-        opt.setName('period').setDescription('Time window')
-          .addChoices(
-            { name: 'All time', value: 'all' },
-            { name: 'Last 30 days', value: '30d' },
-            { name: 'Last 90 days', value: '90d' }
-          )
-      )
-  )
-  .addSubcommand((sub) => sub.setName('quota').setDescription('Quota completion statistics.'))
-  .addSubcommand((sub) => sub.setName('strikes').setDescription('Strike statistics.'))
-  .addSubcommand((sub) => sub.setName('members').setDescription('Member breakdown.'))
   .toJSON();
 
 export const meta = {};
 
-export async function execute(interaction) {
-  await assertPermission(interaction, 'statistics.view');
-
-  const sub = interaction.options.getSubcommand(true);
-  switch (sub) {
-    case 'daily':       return handleWindow(interaction, 'daily');
-    case 'weekly':      return handleWindow(interaction, 'weekly');
-    case 'monthly':     return handleWindow(interaction, 'monthly');
-    case 'user':        return handleUser(interaction);
-    case 'events':      return handleEvents(interaction);
-    case 'attendance':  return handleAttendance(interaction);
-    case 'hosts':       return handleHosts(interaction);
-    case 'attendees':   return handleAttendees(interaction);
-    case 'quota':       return handleQuota(interaction);
-    case 'strikes':     return handleStrikes(interaction);
-    case 'members':     return handleMembers(interaction);
-    default:
-      throw new Error('Unknown /stats subcommand: ' + sub);
-  }
+export async function execute(interaction, ctx) {
+  return openMenuForModule(interaction, ctx, 'stats');
 }
 
-async function handleWindow(interaction, kind) {
+async function handleWindow(interaction, ctx, kind) {
   const fn = kind === 'daily' ? statisticsService.dailyStats
     : kind === 'weekly' ? statisticsService.weeklyStats
     : statisticsService.monthlyStats;
@@ -112,7 +76,7 @@ async function handleWindow(interaction, kind) {
     });
   }
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: kind.charAt(0).toUpperCase() + kind.slice(1) + ' Summary' + (data.periodKey ? ' (' + data.periodKey + ')' : ''),
       description: 'Period: <t:' + startTs + ':f> → <t:' + endTs + ':f>',
@@ -122,8 +86,22 @@ async function handleWindow(interaction, kind) {
   });
 }
 
-async function handleUser(interaction) {
-  const target = interaction.options.getUser('user') || interaction.user;
+async function handleUser(interaction, ctx, params = {}) {
+  const target = params.user ?? interaction.options?.getUser?.('user');
+
+  if (!target) {
+    return replyOrUpdate(interaction, {
+      embeds: [infoEmbed({ title: 'Pick a User', description: 'Select a user to view stats for.' })],
+      components: [new ActionRowBuilder().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId('stats:pick-user')
+          .setPlaceholder('Select a user')
+          .setMinValues(1).setMaxValues(1)
+      )],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   const stats = await statisticsService.userStats(target.id);
 
   const roles = stats.roles.length ? stats.roles.map((r) => '`' + r.key + '`').join(', ') : '_none_';
@@ -179,20 +157,20 @@ async function handleUser(interaction) {
 
   fields.push({ name: 'Recent Quota', value: recentQuota, inline: false });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Stats for ' + target.username, fields })],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleEvents(interaction) {
+async function handleEvents(interaction, ctx) {
   const stats = await statisticsService.eventStats();
   const byStatus = stats.byStatus;
   const statusLines = ['PENDING', 'APPROVED', 'REJECTED', 'CANCELLED']
     .map((s) => '**' + s + ':** ' + (byStatus[s] || 0)).join('\n');
   const typeLines = stats.byType.length ? stats.byType.map((t) => '`' + (t.typeKey || t._id) + '` ' + t.count).join(' • ') : '_none_';
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Event Statistics',
       description: 'Total events: **' + stats.total + '**',
@@ -205,10 +183,10 @@ async function handleEvents(interaction) {
   });
 }
 
-async function handleAttendance(interaction) {
+async function handleAttendance(interaction, ctx) {
   const stats = await statisticsService.attendanceStats();
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Attendance Statistics',
       fields: [
@@ -222,11 +200,10 @@ async function handleAttendance(interaction) {
   });
 }
 
-async function handleHosts(interaction) {
+async function handleHosts(interaction, ctx) {
   const hosts = await statisticsService.hostStats({ top: 10 });
-
   if (hosts.length === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'Top Hosts', description: '_No approved events yet._' })],
       flags: MessageFlags.Ephemeral,
     });
@@ -239,14 +216,14 @@ async function handleHosts(interaction) {
     return rank + ' **' + name + '** — ' + h.count + ' event(s)';
   });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Top Hosts (all time)', description: lines.join('\n') })],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleAttendees(interaction) {
-  const periodRaw = interaction.options.getString('period') || 'all';
+async function handleAttendees(interaction, ctx, params = {}) {
+  const periodRaw = params.period ?? interaction.options?.getString?.('period') ?? 'all';
   let from = null;
   if (periodRaw === '30d') from = new Date(Date.now() - 30 * 86_400_000);
   else if (periodRaw === '90d') from = new Date(Date.now() - 90 * 86_400_000);
@@ -254,7 +231,7 @@ async function handleAttendees(interaction) {
   const stats = await statisticsService.attendanceStats({ mode: 'byUser', from, limit: 10 });
 
   if (!stats.rows || stats.rows.length === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'Top Attendees', description: '_No attendance records yet._' })],
       flags: MessageFlags.Ephemeral,
     });
@@ -268,13 +245,13 @@ async function handleAttendees(interaction) {
 
   const title = periodRaw === 'all' ? 'Top Attendees (all time)' : 'Top Attendees (last ' + periodRaw + ')';
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title, description: lines.join('\n') })],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleQuota(interaction) {
+async function handleQuota(interaction, ctx) {
   const stats = await statisticsService.quotaStats();
   const fields = [];
   for (const cat of ['STAFF', 'LOW_RANK']) {
@@ -285,13 +262,13 @@ async function handleQuota(interaction) {
       inline: true,
     });
   }
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Quota Statistics (all time)', fields })],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleStrikes(interaction) {
+async function handleStrikes(interaction, ctx) {
   const stats = await statisticsService.strikeStats({ top: 10 });
   const byStatus = stats.byStatus || {};
   const statusLines = ['ACTIVE', 'RECOVERED', 'CANCELLED', 'EXPIRED']
@@ -310,13 +287,13 @@ async function handleStrikes(interaction) {
     });
   }
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Strike Statistics', fields })],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleMembers(interaction) {
+async function handleMembers(interaction, ctx) {
   const breakdown = await statisticsService.memberBreakdown();
 
   const statusLines = Object.entries(breakdown.byStatus).map(([k, v]) => '**' + k + ':** ' + v).join('\n') || '_none_';
@@ -326,7 +303,7 @@ async function handleMembers(interaction) {
     ? breakdown.byRobloxRank.slice(0, 10).map((r) => '`' + r.rankName + '`: ' + r.count).join(', ')
     : '_none_';
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Member Breakdown',
       fields: [
@@ -340,9 +317,16 @@ async function handleMembers(interaction) {
   });
 }
 
-async function assertPermission(interaction, permissionKey) {
-  const user = await userRepo.findByDiscordId(interaction.user.id);
-  if (!user) throw new AuthorizationError('You do not have permission to perform this action.');
-  const ok = await permissionService.hasPermission(user.id, permissionKey);
-  if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
-}
+export const HANDLERS = {
+  daily: (i, c) => handleWindow(i, c, 'daily'),
+  weekly: (i, c) => handleWindow(i, c, 'weekly'),
+  monthly: (i, c) => handleWindow(i, c, 'monthly'),
+  user: handleUser,
+  events: handleEvents,
+  attendance: handleAttendance,
+  hosts: handleHosts,
+  attendees: handleAttendees,
+  quota: handleQuota,
+  strikes: handleStrikes,
+  members: handleMembers,
+};

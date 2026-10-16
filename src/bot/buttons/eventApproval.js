@@ -33,7 +33,12 @@ async function handleApprove(interaction, eventId) {
   const perm = await checkPermission(interaction.user.id, 'events.approve');
   if (!perm) throw new AuthorizationError('You do not have permission to approve events.');
 
-  const { event, alreadyApproved } = await eventService.approveEvent(interaction.user.id, eventId);
+const { event, alreadyApproved } = await eventService.approveEvent(
+  interaction.user.id,
+  eventId,
+  { client: interaction.client }
+);
+// dmHost call REMOVED — service handles it now
 
   try {
     const originalEmbed = interaction.message?.embeds?.[0];

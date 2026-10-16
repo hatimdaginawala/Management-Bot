@@ -69,7 +69,9 @@ async function handleView(interaction, eventId) {
 
 async function handleApprove(interaction, eventId) {
   await requirePermission(interaction, 'events.approve');
-  const result = await eventService.approveEvent(interaction.user.id, eventId);
+  const result = await eventService.approveEvent(interaction.user.id, eventId, {
+    client: interaction.client,
+  });
 
   await interaction.update({
     embeds: [successEmbed({

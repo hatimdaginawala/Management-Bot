@@ -1,9 +1,8 @@
+// src/bot/commands/leave.js
+
 import {
   SlashCommandBuilder,
-  ModalBuilder,
   ActionRowBuilder,
-  TextInputBuilder,
-  TextInputStyle,
   StringSelectMenuBuilder,
   MessageFlags,
 } from 'discord.js';
@@ -14,90 +13,26 @@ import { AuthorizationError } from '../../utils/errors.js';
 import { infoEmbed } from '../embedBuilders.js';
 import * as sessions from '../sessions.js';
 import { formatDateRange, formatRelative, resolveUsernames, truncatePlain } from '../utils/format.js';
+import { openMenuForModule, replyOrUpdate } from '../menus/render.js';
 
 export const data = new SlashCommandBuilder()
   .setName('leave')
   .setDescription('Leave requests and approvals.')
-  .addSubcommand((sub) => sub.setName('create').setDescription('Submit a leave request.'))
-  .addSubcommand((sub) =>
-    sub.setName('view').setDescription('View leave history for a user.')
-      .addUserOption((opt) => opt.setName('user').setDescription('Target user (default: yourself)'))
-  )
-  .addSubcommand((sub) => sub.setName('active').setDescription('List currently active approved leaves.'))
-  .addSubcommand((sub) => sub.setName('approve').setDescription('Approve a pending leave request.'))
-  .addSubcommand((sub) => sub.setName('reject').setDescription('Reject a pending leave request.'))
-  .addSubcommand((sub) => sub.setName('end').setDescription('End an approved leave early.'))
-  .addSubcommand((sub) => sub.setName('cancel').setDescription('Cancel your own pending leave request.'))
   .toJSON();
 
 export const meta = {};
 
-export async function execute(interaction) {
-  const sub = interaction.options.getSubcommand(true);
-  switch (sub) {
-    case 'create':  return handleCreate(interaction);
-    case 'view':    return handleView(interaction);
-    case 'active':  return handleActive(interaction);
-    case 'approve': return startApproveFlow(interaction);
-    case 'reject':  return startRejectFlow(interaction);
-    case 'end':     return startEndFlow(interaction);
-    case 'cancel':  return handleCancel(interaction);
-    default:
-      throw new Error('Unknown /leave subcommand: ' + sub);
-  }
+export async function execute(interaction, ctx) {
+  return openMenuForModule(interaction, ctx, 'leave');
 }
 
-async function handleCreate(interaction) {
-  await assertPermission(interaction, 'leave.create');
-
-  const modal = new ModalBuilder()
-    .setCustomId('modal:leave-create')
-    .setTitle('Submit Leave Request');
-
-  const startInput = new TextInputBuilder()
-    .setCustomId('startAt')
-    .setLabel('Start date (YYYY-MM-DD)')
-    .setPlaceholder('e.g. 2026-10-15')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMinLength(10)
-    .setMaxLength(10);
-
-  const endInput = new TextInputBuilder()
-    .setCustomId('endAt')
-    .setLabel('End date (YYYY-MM-DD)')
-    .setPlaceholder('e.g. 2026-10-22')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMinLength(10)
-    .setMaxLength(10);
-
-  const reasonInput = new TextInputBuilder()
-    .setCustomId('reason')
-    .setLabel('Reason')
-    .setPlaceholder('Why you need leave')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(true)
-    .setMinLength(3)
-    .setMaxLength(500);
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(startInput),
-    new ActionRowBuilder().addComponents(endInput),
-    new ActionRowBuilder().addComponents(reasonInput)
-  );
-
-  return interaction.showModal(modal);
-}
-
-async function handleView(interaction) {
+async function handleView(interaction, ctx, params = {}) {
   await assertPermission(interaction, 'leave.view');
-  const target = interaction.options.getUser('user') || interaction.user;
+  const target = params.user ?? interaction.options?.getUser?.('user') ?? interaction.user;
 
   const result = await leaveService.listLeaves({ discordId: target.id, pageSize: 20 });
-
   if (result.total === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({
         title: 'No Leave History',
         description: '<@' + target.id + '> has no leave records.',
@@ -114,7 +49,7 @@ async function handleView(interaction) {
            (l.reason ? '\n  _' + l.reason + '_' : '');
   });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Leave History for ' + target.username,
       description: lines.join('\n'),
@@ -123,17 +58,15 @@ async function handleView(interaction) {
   });
 }
 
-async function handleActive(interaction) {
+async function handleActive(interaction, ctx) {
   await assertPermission(interaction, 'leave.view');
 
   const result = await leaveService.listLeaves({ status: 'APPROVED', pageSize: 100 });
   const now = new Date();
-  const active = result.items.filter(
-    (l) => new Date(l.start_at) <= now && new Date(l.end_at) >= now
-  );
+  const active = result.items.filter((l) => new Date(l.start_at) <= now && new Date(l.end_at) >= now);
 
   if (active.length === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'No Active Leaves', description: 'No members are currently on approved leave.' })],
       flags: MessageFlags.Ephemeral,
     });
@@ -144,7 +77,7 @@ async function handleActive(interaction) {
     return '• <@' + l.discord_id + '> — until <t:' + end + ':d> — ' + l.reason;
   });
 
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
       title: 'Active Leaves (' + active.length + ')',
       description: lines.join('\n'),
@@ -153,26 +86,25 @@ async function handleActive(interaction) {
   });
 }
 
-async function startApproveFlow(interaction) {
+async function startApproveFlow(interaction, ctx) {
   await assertPermission(interaction, 'leave.approve');
   return showLeavePicker(interaction, 'PENDING', 'leave:approve:request', 'Approve Leave');
 }
 
-async function startRejectFlow(interaction) {
+async function startRejectFlow(interaction, ctx) {
   await assertPermission(interaction, 'leave.reject');
   return showLeavePicker(interaction, 'PENDING', 'leave:reject:request', 'Reject Leave');
 }
 
-async function startEndFlow(interaction) {
+async function startEndFlow(interaction, ctx) {
   await assertPermission(interaction, 'leave.manage');
   return showLeavePicker(interaction, 'APPROVED', 'leave:end:request', 'End Leave');
 }
 
 async function showLeavePicker(interaction, status, customId, title) {
   const result = await leaveService.listLeaves({ status, pageSize: 25 });
-
   if (result.total === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({
         title: 'No ' + status + ' Leaves',
         description: 'There are no ' + status.toLowerCase() + ' leave requests.',
@@ -181,46 +113,35 @@ async function showLeavePicker(interaction, status, customId, title) {
     });
   }
 
-  const usernames = await resolveUsernames(
-    interaction.client,
-    result.items.map((l) => l.discord_id)
-  );
-
+  const usernames = await resolveUsernames(interaction.client, result.items.map((l) => l.discord_id));
   const options = result.items.map((l) => {
     const username = usernames.get(l.discord_id) || 'unknown user';
     const period = formatDateRange(l.start_at, l.end_at);
     const submittedAgo = formatRelative(l.created_at);
     const reasonSnippet = truncatePlain(l.reason || 'no reason', 60);
-
-    const label = ('@' + username).slice(0, 100);
-    const description = truncatePlain(
-      period + ' · submitted ' + submittedAgo + ' · ' + reasonSnippet,
-      100
-    );
-
-    return { label, description, value: String(l.id) };
+    return {
+      label: ('@' + username).slice(0, 100),
+      description: truncatePlain(period + ' · submitted ' + submittedAgo + ' · ' + reasonSnippet, 100),
+      value: String(l.id),
+    };
   });
 
   const menu = new StringSelectMenuBuilder()
     .setCustomId(customId)
     .setPlaceholder('Select a leave request')
-    .setMinValues(1)
-    .setMaxValues(1)
-    .addOptions(options);
+    .setMinValues(1).setMaxValues(1).addOptions(options);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({
-      title: title,
+      title,
       description: '**' + result.total + '** ' + status.toLowerCase() + ' request(s). Select one to act on.',
     })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handleCancel(interaction) {
+async function handleCancel(interaction, ctx) {
   const result = await leaveService.listLeaves({
     status: 'PENDING',
     discordId: interaction.user.id,
@@ -228,7 +149,7 @@ async function handleCancel(interaction) {
   });
 
   if (result.total === 0) {
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({
         title: 'No Pending Leave',
         description: 'You do not have a pending leave request to cancel.',
@@ -238,11 +159,10 @@ async function handleCancel(interaction) {
   }
 
   if (result.total === 1) {
-    const leave = result.items[0];
-    await leaveService.cancelLeave(interaction.user.id, leave.id, {
+    await leaveService.cancelLeave(interaction.user.id, result.items[0].id, {
       reason: 'Cancelled by requester',
     });
-    return interaction.reply({
+    return replyOrUpdate(interaction, {
       embeds: [infoEmbed({ title: 'Leave Cancelled', description: 'Your pending leave request has been cancelled.' })],
       flags: MessageFlags.Ephemeral,
     });
@@ -261,15 +181,11 @@ async function handleCancel(interaction) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('leave:self:cancel')
     .setPlaceholder('Select a leave to cancel')
-    .setMinValues(1)
-    .setMaxValues(1)
-    .addOptions(options);
+    .setMinValues(1).setMaxValues(1).addOptions(options);
 
-  const row = new ActionRowBuilder().addComponents(menu);
-
-  return interaction.reply({
+  return replyOrUpdate(interaction, {
     embeds: [infoEmbed({ title: 'Cancel Leave', description: 'Select the pending leave you want to cancel.' })],
-    components: [row],
+    components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -280,3 +196,12 @@ async function assertPermission(interaction, permissionKey) {
   const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }
+
+export const HANDLERS = {
+  view: handleView,
+  active: handleActive,
+  approve: startApproveFlow,
+  reject: startRejectFlow,
+  end: startEndFlow,
+  cancel: handleCancel,
+};

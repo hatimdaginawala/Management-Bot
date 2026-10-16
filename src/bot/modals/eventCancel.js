@@ -5,7 +5,6 @@ import { successEmbed, errorEmbed, COLORS } from '../embedBuilders.js';
 import { AuthorizationError } from '../../utils/errors.js';
 import * as userRepo from '../../db/repositories/user.repository.js';
 import logger from '../../config/logger.js';
-import { dmHost } from '../buttons/eventApproval.js';
 
 export const customId = 'modal:event-cancel:*';
 export const meta = {};
@@ -27,7 +26,10 @@ export async function execute(interaction) {
   const reasonRaw = interaction.fields.getTextInputValue('reason') || '';
   const reason = reasonRaw.trim() || null;
 
-  const event = await eventService.cancelEvent(interaction.user.id, eventId, { reason });
+  const event = await eventService.cancelEvent(interaction.user.id, eventId, {
+    reason,
+    client: interaction.client,
+  });
 
   try {
     const originalEmbed = interaction.message?.embeds?.[0];
@@ -39,14 +41,6 @@ export async function execute(interaction) {
   } catch (err) {
     logger.debug({ err: err.message }, 'Could not edit approval message on cancel');
   }
-
-  await dmHost(interaction.client, event, {
-    title: 'Event Cancelled',
-    color: COLORS.WARNING,
-    approverId: interaction.user.id,
-    reason,
-    extraLine: 'Your event has been cancelled. Any attendance credited for it has been reversed.',
-  });
 
   const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
 

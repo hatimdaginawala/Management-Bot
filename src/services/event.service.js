@@ -12,27 +12,12 @@ import {
 } from '../utils/errors.js';
 import logger from '../config/logger.js';
 import { db } from '../db/client.js';
+import { dmHost } from '../bot/buttons/eventApproval.js';
+import { COLORS } from '../bot/embedBuilders.js';
 
 const MAX_ATTENDEES = 200;
 const DEFAULT_COOLDOWN_MINUTES = 5;
 const DEFAULT_APPROVAL_REQUIRED = true;
-
-/**
- * Event service.
- *
- * Public API identical to the Mongoose version.
- *
- * Idempotency strategy (no transactions in the old version):
- *   - createEvent: transaction wraps event insert + attendee inserts
- *   - approveEvent: atomic status CAS via approveAtomic; attendance
- *     fan-out is idempotent thanks to unique (event_id, user_id)
- *   - cancelEvent: transaction wraps status change + attendance delete
- *   - updateEvent: transaction wraps attendee replace + attendance re-fan-out
- *
- * The repository exposes both atomic single-statement methods and db-
- * level transaction support. Where multiple writes must succeed or fail
- * together, we use `db.transaction(...)`.
- */
 
 // ============================================================
 //  Settings helpers
@@ -127,11 +112,6 @@ async function checkCooldown(hostDiscordId, cooldownMs) {
 //  Attendance fan-out
 // ============================================================
 
-/**
- * Fan out attendance rows for an approved event.
- * Idempotent via the unique (event_id, user_id) index.
- * Returns { created, skipped }.
- */
 async function writeAttendanceForEvent(event, attendees, trx = db) {
   const activeEntries = attendees.filter((e) => e.resolved_user_id);
   if (activeEntries.length === 0) return { created: 0, skipped: 0 };
@@ -147,6 +127,34 @@ async function writeAttendanceForEvent(event, attendees, trx = db) {
   }));
 
   return attendanceRepo.ensurePresentBatch(rows);
+}
+
+// ============================================================
+//  Host DM helper
+// ============================================================
+
+async function notifyHost(client, event, {
+  title,
+  color,
+  reason = null,
+  extraLine = null,
+  actorId = null,
+} = {}) {
+  if (!client) return;
+  try {
+    await dmHost(client, event, {
+      title,
+      color,
+      approverId: actorId,
+      reason,
+      extraLine,
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err.message, eventId: event.id },
+      'Host DM failed (non-fatal)'
+    );
+  }
 }
 
 // ============================================================
@@ -199,8 +207,6 @@ export async function createEvent(actorDiscordId, payload) {
 
   const status = approvalRequired ? 'PENDING' : 'APPROVED';
 
-  // Transaction: create event + attendees, and (if auto-approved)
-  // fan out attendance atomically.
   const result = await db.transaction(async (trx) => {
     const created = await eventRepo.create({
       hostUserId: host?.id ?? null,
@@ -258,7 +264,7 @@ export async function createEvent(actorDiscordId, payload) {
 //  approveEvent
 // ============================================================
 
-export async function approveEvent(actorDiscordId, eventId) {
+export async function approveEvent(actorDiscordId, eventId, { client = null } = {}) {
   const event = await eventRepo.approveAtomic(eventId, { approvedBy: actorDiscordId });
 
   if (!event) {
@@ -286,8 +292,17 @@ export async function approveEvent(actorDiscordId, eventId) {
     after: { status: 'APPROVED' },
   });
 
+  const enriched = { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+
+  await notifyHost(client, enriched, {
+    title: 'Event Approved',
+    color: COLORS.SUCCESS,
+    actorId: actorDiscordId,
+    extraLine: 'Your event has been approved. Attendance has been credited.',
+  });
+
   return {
-    event: { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) },
+    event: enriched,
     alreadyApproved: false,
   };
 }
@@ -296,7 +311,7 @@ export async function approveEvent(actorDiscordId, eventId) {
 //  rejectEvent
 // ============================================================
 
-export async function rejectEvent(actorDiscordId, eventId, { reason }) {
+export async function rejectEvent(actorDiscordId, eventId, { reason, client = null } = {}) {
   if (!reason || reason.trim().length < 3) {
     throw new ValidationError('Rejection requires a reason.');
   }
@@ -323,14 +338,24 @@ export async function rejectEvent(actorDiscordId, eventId, { reason }) {
   });
 
   const attendees = await eventAttendeeRepo.listByEvent(event.id);
-  return { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+  const enriched = { ...event, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+
+  await notifyHost(client, enriched, {
+    title: 'Event Rejected',
+    color: COLORS.ERROR,
+    actorId: actorDiscordId,
+    reason: reason.trim(),
+    extraLine: 'Your event was rejected. Contact High Command if you believe this is an error.',
+  });
+
+  return enriched;
 }
 
 // ============================================================
 //  cancelEvent
 // ============================================================
 
-export async function cancelEvent(actorDiscordId, eventId, { reason = null } = {}) {
+export async function cancelEvent(actorDiscordId, eventId, { reason = null, client = null } = {}) {
   const existing = await eventRepo.findById(eventId);
   if (!existing) throw new NotFoundError('Event', { id: String(eventId) });
 
@@ -344,7 +369,6 @@ export async function cancelEvent(actorDiscordId, eventId, { reason = null } = {
 
   const previousStatus = existing.status;
 
-  // Transaction: status update + attendance removal
   await db.transaction(async (trx) => {
     await eventRepo.updateById(existing.id, {
       status: 'CANCELLED',
@@ -372,7 +396,17 @@ export async function cancelEvent(actorDiscordId, eventId, { reason = null } = {
     reason,
   });
 
-  return { ...updated, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+  const enriched = { ...updated, attendeeEntries: attendees.map(toAttendeeEntryShape) };
+
+  await notifyHost(client, enriched, {
+    title: 'Event Cancelled',
+    color: COLORS.WARNING,
+    actorId: actorDiscordId,
+    reason,
+    extraLine: 'Your event has been cancelled. Any attendance credited for it has been reversed.',
+  });
+
+  return enriched;
 }
 
 // ============================================================
@@ -473,7 +507,6 @@ export async function listEvents({
     pageSize,
   });
 
-  // Enrich with attendee entries (needed by command handlers)
   const enriched = await Promise.all(
     items.map(async (e) => {
       const attendees = await eventAttendeeRepo.listByEvent(e.id);
@@ -498,10 +531,6 @@ export async function getLastEventByHost(hostDiscordId) {
 //  Helpers
 // ============================================================
 
-/**
- * Convert an `event_attendees` row into the shape command handlers
- * expect from the old Mongoose `attendeeEntries` array.
- */
 function toAttendeeEntryShape(row) {
   return {
     discordId: row.discord_id,
