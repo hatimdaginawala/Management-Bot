@@ -51,18 +51,31 @@ export async function execute(interaction) {
 }
 
 async function coerceValue(path, raw) {
-  const current = await settingsService.getSetting(path);
+  const meta = SETTINGS_META[path];
+  const format = meta?.format;
 
-  if (typeof current === 'boolean') {
+  // Channel IDs are always strings — never parse them.
+  if (format === 'channel') {
+    if (raw === 'null' || raw === 'none' || raw === 'unset') return null;
+    return raw;
+  }
+
+  if (format === 'boolean') {
     const low = raw.toLowerCase();
     if (['true', 'yes', 'y', '1', 'on'].includes(low)) return true;
     if (['false', 'no', 'n', '0', 'off'].includes(low)) return false;
     throw new ValidationError('Expected a boolean (true/false/yes/no).');
   }
 
-  if (typeof current === 'number') {
+  if (format && format.startsWith('number:')) {
     const n = Number.parseInt(raw, 10);
     if (!Number.isInteger(n)) throw new ValidationError('Expected an integer.');
+    return n;
+  }
+
+  if (format === 'weekday') {
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 6) throw new ValidationError('Expected 0–6.');
     return n;
   }
 

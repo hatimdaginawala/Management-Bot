@@ -138,15 +138,23 @@ export async function getSettings() {
 
 export async function getSetting(path) {
   const row = await settingsRepo.findByKey(path);
-  if (row) return safeParse(row.value_json);
-
-  // Fall back to defaults
+  if (row) {
+    const parsed = safeParse(row.value_json);
+    // Defensive: for channel-type settings, always return a string or null.
+    const meta = SETTINGS_PATHS[path];
+    if (meta && typeof parsed === 'number' && path.startsWith('channels.')) {
+      // Corrupted legacy value — coerce to string. It's already lossy though.
+      return String(parsed);
+    }
+    return parsed;
+  }
   return readPath(DEFAULT_SETTINGS, path);
 }
-
 function safeParse(json) {
+  if (json === null || json === undefined) return null;
+  if (typeof json !== 'string') return json;  // already parsed by driver
   try {
-    return typeof json === 'string' ? JSON.parse(json) : json;
+    return JSON.parse(json);
   } catch {
     return null;
   }

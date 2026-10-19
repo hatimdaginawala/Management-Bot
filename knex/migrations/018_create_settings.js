@@ -29,7 +29,7 @@ export async function up(knex) {
     //   boolean -> true
     //   null    -> null
     //   json    -> {"a":1}
-    table.json('value_json').notNullable();
+    table.text('value_json').notNullable();
 
     table.string('description', 255).nullable();
 
