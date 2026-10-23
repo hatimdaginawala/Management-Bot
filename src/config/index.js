@@ -24,16 +24,28 @@ const config = {
   mongo: {
     uri: required('MONGODB_URI'),
   },
-  mysql: {
-    host: optional('MYSQL_HOST', '127.0.0.1'),
-    port: parseInt(optional('MYSQL_PORT', '3306'), 10),
-    user: required('MYSQL_USER'),
-    password: required('MYSQL_PASSWORD'),
-    database:
-      optional('NODE_ENV', 'development') === 'test'
-        ? required('MYSQL_TEST_DATABASE')
-        : required('MYSQL_DATABASE'),
-  },
+  // mysql: {
+  //   host: optional('MYSQL_HOST', '127.0.0.1'),
+  //   port: parseInt(optional('MYSQL_PORT', '3306'), 10),
+  //   user: required('MYSQL_USER'),
+  //   password: required('MYSQL_PASSWORD'),
+  //   database:
+  //     optional('NODE_ENV', 'development') === 'test'
+  //       ? required('MYSQL_TEST_DATABASE')
+  //       : required('MYSQL_DATABASE'),
+  // },
+  
+mysql: {
+  host: required('MYSQL_HOST'),
+  port: parseInt(required('MYSQL_PORT'), 10),
+  user: required('MYSQL_USER'),
+  password: required('MYSQL_PASSWORD'),
+  database:
+    optional('NODE_ENV', 'development') === 'test'
+      ? required('MYSQL_TEST_DATABASE')
+      : required('MYSQL_DATABASE'),
+},
+
 
   discord: {
     token: required('DISCORD_TOKEN'),
