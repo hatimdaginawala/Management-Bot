@@ -134,20 +134,32 @@ export async function dmHost(client, event, {
 
     const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
 
-    const fields = [
-      { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
-      { name: 'Logged', value: '<t:' + ts + ':R>', inline: true },
-      { name: 'Attendees', value: String(event.attendeeEntries.length), inline: true },
-    ];
+const fields = [
+  { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
+  { name: 'Logged', value: '<t:' + ts + ':R>', inline: true },
+  { name: 'Attendees', value: String(event.attendeeEntries.length), inline: true },
+];
 
-    if (approverId) {
-      fields.push({
-        name: color === COLORS.SUCCESS ? 'Approved By' : 'Reviewed By',
-        value: '<@' + approverId + '>',
-        inline: true,
-      });
+if (event.cohost_discord_id) {
+  fields.push({ name: 'Co-host', value: '<@' + event.cohost_discord_id + '>', inline: true });
+}
+
+if (approverId) {
+  fields.push({
+    name: color === COLORS.SUCCESS ? 'Approved By' : 'Reviewed By',
+    value: '<@' + approverId + '>',
+    inline: true,
+  });
+}
+// After DMing the host, also DM the cohost if set
+if (event.cohost_discord_id && event.cohost_discord_id !== event.host_discord_id) {
+  try {
+    const cohostUser = await client.users.fetch(event.cohost_discord_id).catch(() => null);
+    if (cohostUser) {
+      await cohostUser.send({ embeds: [embed] });
     }
-
+  } catch {}
+}
     if (reason) {
       fields.push({ name: 'Reason', value: reason, inline: false });
     }

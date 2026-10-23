@@ -90,11 +90,20 @@ function buildEventCreateModal() {
     .setRequired(false)
     .setMaxLength(1000);
 
+  const cohostInput = new TextInputBuilder()
+    .setCustomId('cohost')
+    .setLabel('Co-host (optional, Discord ID or mention)')
+    .setPlaceholder('e.g. 820331262816157776')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(30);
+
   modal.addComponents(
     new ActionRowBuilder().addComponents(typeInput),
     new ActionRowBuilder().addComponents(attendeesInput),
     new ActionRowBuilder().addComponents(proofInput),
-    new ActionRowBuilder().addComponents(notesInput)
+    new ActionRowBuilder().addComponents(notesInput),
+    new ActionRowBuilder().addComponents(cohostInput)
   );
 
   return modal;

@@ -18,10 +18,6 @@ export async function findPendingForUser(userId, trx = db) {
   }, { ...CTX, method: 'findPendingForUser' });
 }
 
-/**
- * Idempotent creation of a threshold removal request.
- * Returns { created, row }.
- */
 export async function ensurePending(data, trx = db) {
   return withDbErrors(async () => {
     const existing = await trx('removal_requests')
@@ -32,9 +28,9 @@ export async function ensurePending(data, trx = db) {
     const [id] = await trx('removal_requests').insert({
       user_id: data.userId,
       discord_id: data.discordId,
-      reason: data.reason,
-      strike_count: data.strikeCount,
-      strike_threshold: data.strikeThreshold,
+      reason: data.reason ?? 'THRESHOLD',
+      strike_count: data.strikeCount ?? 0,
+      strike_threshold: data.strikeThreshold ?? 0,
       description: data.description ?? null,
       status: 'PENDING',
     });
@@ -43,18 +39,14 @@ export async function ensurePending(data, trx = db) {
   }, { ...CTX, method: 'ensurePending' });
 }
 
-/**
- * Create a manual removal request. Throws ConflictError if a pending
- * one already exists (enforced by the caller's pre-check).
- */
 export async function createManual(data, trx = db) {
   return withDbErrors(async () => {
     const [id] = await trx('removal_requests').insert({
       user_id: data.userId,
       discord_id: data.discordId,
-      reason: 'MANUAL',
-      strike_count: data.strikeCount,
-      strike_threshold: data.strikeThreshold,
+      reason: data.reason ?? 'MANUAL',
+      strike_count: data.strikeCount ?? 0,
+      strike_threshold: data.strikeThreshold ?? 0,
       description: data.description,
       status: 'PENDING',
     });
@@ -63,9 +55,6 @@ export async function createManual(data, trx = db) {
   }, { ...CTX, method: 'createManual' });
 }
 
-/**
- * Atomic PENDING → APPROVED with effective date.
- */
 export async function approveAtomic(id, {
   reviewedBy,
   reason,
@@ -87,9 +76,6 @@ export async function approveAtomic(id, {
   }, { ...CTX, method: 'approveAtomic' });
 }
 
-/**
- * Atomic PENDING → DISMISSED.
- */
 export async function dismissAtomic(id, { reviewedBy, reason }) {
   return withDbErrors(async () => {
     const affected = await db('removal_requests')
@@ -106,26 +92,16 @@ export async function dismissAtomic(id, { reviewedBy, reason }) {
   }, { ...CTX, method: 'dismissAtomic' });
 }
 
-/**
- * Find APPROVED removals whose effective date has passed and which
- * haven't yet been applied.
- */
 export async function findDueForApplication(asOf = new Date()) {
   return withDbErrors(async () => {
     const rows = await db('removal_requests')
-      .where({
-        status: 'APPROVED',
-        applied_at: null,
-      })
+      .where({ status: 'APPROVED' })
+      .whereNull('applied_at')
       .where('removal_effective_at', '<=', asOf);
     return convertRows(rows);
   }, { ...CTX, method: 'findDueForApplication' });
 }
 
-/**
- * Atomically mark a removal as applied.
- * Returns the updated row, or null if already applied.
- */
 export async function markAppliedAtomic(id, trx = db) {
   return withDbErrors(async () => {
     const affected = await trx('removal_requests')
@@ -138,9 +114,10 @@ export async function markAppliedAtomic(id, trx = db) {
   }, { ...CTX, method: 'markAppliedAtomic' });
 }
 
-export async function listPending({ page = 1, pageSize = 25 } = {}) {
+export async function listPending({ page = 1, pageSize = 25, reason = null } = {}) {
   return withDbErrors(async () => {
     const q = db('removal_requests').where('status', 'PENDING');
+    if (reason) q.where('reason', reason);
     const [countRow] = await q.clone().count({ count: '*' });
     const total = Number(countRow.count);
 

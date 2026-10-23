@@ -12,6 +12,7 @@ import * as eventService from '../../services/event.service.js';
 import * as settingsService from '../../services/settings.service.js';
 import { successEmbed, infoEmbed, errorEmbed, COLORS } from '../embedBuilders.js';
 import { replyOrUpdate } from '../menus/render.js';
+import { EVENT_TYPE_SEEDS } from '../../constants/eventTypes.js';
 import logger from '../../config/logger.js';
 
 export const data = new SlashCommandBuilder()
@@ -20,9 +21,11 @@ export const data = new SlashCommandBuilder()
   .addStringOption((opt) =>
     opt
       .setName('type')
-      .setDescription('Event type (patrol, ct, dt, raid, tryout, other)')
+      .setDescription('Event type')
       .setRequired(true)
-      .setAutocomplete(true)
+      .addChoices(
+        ...EVENT_TYPE_SEEDS.map((t) => ({ name: t.name, value: t.key }))
+      )
   )
   .addStringOption((opt) =>
     opt
@@ -45,6 +48,12 @@ export const data = new SlashCommandBuilder()
       .setRequired(false)
       .setMaxLength(1000)
   )
+  .addUserOption((opt) =>
+    opt
+      .setName('cohost')
+      .setDescription('Optional co-host (must be a Discord user)')
+      .setRequired(false)
+  )
   .toJSON();
 
 export const meta = {};
@@ -55,6 +64,7 @@ export async function execute(interaction, ctx) {
   const proofUrl = interaction.options.getString('proofurl', true).trim();
   const notesRaw = interaction.options.getString('notes') ?? '';
   const notes = notesRaw.trim();
+  const cohostUser = interaction.options.getUser('cohost');
 
   const attendees = parseAttendees(attendeesRaw);
 
@@ -63,6 +73,16 @@ export async function execute(interaction, ctx) {
       embeds: [errorEmbed({
         title: 'No Attendees',
         description: 'You must provide at least one attendee.',
+      })],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  if (cohostUser && cohostUser.id === interaction.user.id) {
+    return replyOrUpdate(interaction, {
+      embeds: [errorEmbed({
+        title: 'Invalid Co-host',
+        description: 'You cannot be the co-host of your own event.',
       })],
       flags: MessageFlags.Ephemeral,
     });
@@ -77,6 +97,7 @@ export async function execute(interaction, ctx) {
     event = await eventService.createEvent(interaction.user.id, {
       eventTypeKey,
       attendees,
+      cohost: cohostUser ? { discordId: cohostUser.id } : null,
       proofUrl,
       notes,
     });
@@ -90,17 +111,22 @@ export async function execute(interaction, ctx) {
   }
 
   if (event.status === 'APPROVED') {
+    const fields = [
+      { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
+      { name: 'Hosted By', value: '<@' + event.host_discord_id + '>', inline: true },
+      { name: 'Attendees Credited', value: String(event.attendeeEntries.length), inline: true },
+      { name: 'Logged', value: '<t:' + Math.floor(new Date(event.created_at).getTime() / 1000) + ':R>', inline: true },
+      { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
+    ];
+    if (event.cohost_discord_id) {
+      fields.push({ name: 'Co-host', value: '<@' + event.cohost_discord_id + '>', inline: true });
+    }
+
     return interaction.editReply({
       embeds: [successEmbed({
         title: 'Event Logged',
         description: 'Your event was recorded and approved automatically.',
-        fields: [
-          { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
-          { name: 'Hosted By', value: '<@' + event.host_discord_id + '>', inline: true },
-          { name: 'Attendees Credited', value: String(event.attendeeEntries.length), inline: true },
-          { name: 'Logged', value: '<t:' + Math.floor(new Date(event.created_at).getTime() / 1000) + ':R>', inline: true },
-          { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
-        ],
+        fields,
       })],
     });
   }
@@ -137,6 +163,10 @@ export async function execute(interaction, ctx) {
       )
       .setTimestamp(new Date());
 
+    if (event.cohost_discord_id) {
+      reviewEmbed.addFields({ name: 'Co-host', value: '<@' + event.cohost_discord_id + '>', inline: true });
+    }
+
     if (event.notes) {
       reviewEmbed.addFields({ name: 'Notes', value: event.notes, inline: false });
     }
@@ -172,47 +202,6 @@ export async function execute(interaction, ctx) {
       })],
     });
   }
-}
-
-export async function autocomplete(interaction) {
-  const focused = interaction.options.getFocused(true);
-  if (focused.name !== 'type') {
-    return interaction.respond([]).catch(() => {});
-  }
-
-  const q = String(focused.value || '').toLowerCase();
-
-  // Try the DB first.
-  try {
-    const mod = await import('../../db/repositories/eventType.repository.js');
-    const types = await mod.list({ includeInactive: false });
-    if (types && types.length > 0) {
-      const filtered = types
-        .filter((t) => t.key.includes(q) || (t.name || '').toLowerCase().includes(q))
-        .slice(0, 25)
-        .map((t) => ({ name: t.name || t.key, value: t.key }));
-      if (filtered.length > 0) {
-        return interaction.respond(filtered).catch(() => {});
-      }
-      return interaction.respond([]).catch(() => {});
-    }
-  } catch (err) {
-    // fall through to hardcoded
-  }
-
-  // Fallback: seeded event types.
-  const seeded = [
-    { name: 'Patrol', value: 'patrol' },
-    { name: 'CT', value: 'ct' },
-    { name: 'DT', value: 'dt' },
-    { name: 'Raid', value: 'raid' },
-    { name: 'Tryout', value: 'tryout' },
-    { name: 'Other', value: 'other' },
-  ];
-  const filtered = seeded.filter(
-    (t) => t.value.includes(q) || t.name.toLowerCase().includes(q)
-  );
-  return interaction.respond(filtered.slice(0, 25)).catch(() => {});
 }
 
 function parseAttendees(raw) {

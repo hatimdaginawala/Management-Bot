@@ -37,14 +37,20 @@ async function handleView(interaction, eventId) {
     CANCELLED: '⚫',
   }[event.status] || '⚪';
 
-  const fields = [
-    { name: 'Status', value: statusEmoji + ' `' + event.status + '`', inline: true },
-    { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
-    { name: 'Host', value: '<@' + event.host_discord_id + '>', inline: true },
-    { name: 'Attendees', value: String((event.attendeeEntries || []).length) + ' listed, ' + String(attendanceCount) + ' credited', inline: false },
-    { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
-  ];
+const fields = [
+  { name: 'Status', value: statusEmoji + ' `' + event.status + '`', inline: true },
+  { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
+  { name: 'Host', value: '<@' + event.host_discord_id + '>', inline: true },
+];
 
+if (event.cohost_discord_id) {
+  fields.push({ name: 'Co-host', value: '<@' + event.cohost_discord_id + '>', inline: true });
+}
+
+fields.push(
+  { name: 'Attendees', value: String((event.attendeeEntries || []).length) + ' listed, ' + String(attendanceCount) + ' credited', inline: false },
+  { name: 'Proof', value: '<' + event.proof_url + '>', inline: false }
+);
   if (event.notes) {
     fields.push({ name: 'Notes', value: truncate(event.notes, 500), inline: false });
   }

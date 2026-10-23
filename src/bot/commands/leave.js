@@ -196,7 +196,28 @@ async function assertPermission(interaction, permissionKey) {
   const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }
+async function startPermanentLeaveFlow(interaction, ctx) {
+  await assertPermission(interaction, 'leave.create');
 
+  const modal = new (await import('discord.js')).ModalBuilder()
+    .setCustomId('modal:leave-permanent')
+    .setTitle('Request Permanent Leave');
+
+  const reasonInput = new (await import('discord.js')).TextInputBuilder()
+    .setCustomId('reason')
+    .setLabel('Reason for leaving')
+    .setPlaceholder('Why you are leaving the group')
+    .setStyle((await import('discord.js')).TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMinLength(3)
+    .setMaxLength(500);
+
+  modal.addComponents(
+    new (await import('discord.js')).ActionRowBuilder().addComponents(reasonInput)
+  );
+
+  return interaction.showModal(modal);
+}
 export const HANDLERS = {
   view: handleView,
   active: handleActive,
@@ -204,4 +225,5 @@ export const HANDLERS = {
   reject: startRejectFlow,
   end: startEndFlow,
   cancel: handleCancel,
+  permanent: startPermanentLeaveFlow,
 };

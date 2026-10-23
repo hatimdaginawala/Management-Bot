@@ -19,14 +19,17 @@ export async function findLatestByHost(hostDiscordId) {
   }, { ...CTX, method: 'findLatestByHost' });
 }
 
-export async function create(data) {
+export async function create(data, trx = db) {
   return withDbErrors(async () => {
-    const [id] = await db('events').insert({
+    const [id] = await trx('events').insert({
       host_user_id: data.hostUserId ?? null,
       host_discord_id: data.hostDiscordId,
       host_discord_username: data.hostDiscordUsername ?? null,
       host_roblox_id: data.hostRobloxId ?? null,
       host_roblox_username: data.hostRobloxUsername ?? null,
+      cohost_user_id: data.cohostUserId ?? null,
+      cohost_discord_id: data.cohostDiscordId ?? null,
+      cohost_discord_username: data.cohostDiscordUsername ?? null,
       event_type_id: data.eventTypeId,
       event_type_key: data.eventTypeKey,
       proof_url: data.proofUrl,
@@ -43,7 +46,7 @@ export async function create(data) {
       cancellation_reason: data.cancellationReason ?? null,
       cooldown_anchor: data.cooldownAnchor ?? new Date(),
     });
-    const row = await db('events').where({ id }).first();
+    const row = await trx('events').where({ id }).first();
     return convertRow(row);
   }, { ...CTX, method: 'create' });
 }
@@ -62,6 +65,9 @@ export async function updateById(id, data) {
     if (data.cancelledBy !== undefined) patch.cancelled_by = data.cancelledBy;
     if (data.cancelledAt !== undefined) patch.cancelled_at = data.cancelledAt;
     if (data.cancellationReason !== undefined) patch.cancellation_reason = data.cancellationReason;
+    if (data.cohostUserId !== undefined) patch.cohost_user_id = data.cohostUserId;
+    if (data.cohostDiscordId !== undefined) patch.cohost_discord_id = data.cohostDiscordId;
+    if (data.cohostDiscordUsername !== undefined) patch.cohost_discord_username = data.cohostDiscordUsername;
 
     if (Object.keys(patch).length > 0) {
       await db('events').where({ id }).update(patch);

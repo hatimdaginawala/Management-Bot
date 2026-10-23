@@ -375,6 +375,15 @@ export const CATALOG = Object.freeze({
         module: 'leave',
         fn: 'cancel',
       },
+      {
+  key: 'permanent',
+  label: 'Permanent Leave',
+  description: 'Permanently leave the 24th Guard Rifles.',
+  permission: 'leave.create',
+  mode: 'route',
+  module: 'leave',
+  fn: 'permanent',
+},
     ],
   },
 
@@ -542,6 +551,15 @@ export const CATALOG = Object.freeze({
     emoji: '👥',
     description: 'Browse and filter group members.',
     actions: [
+      {
+  key: 'remove',
+  label: 'Remove Member',
+  description: 'Permanently remove a member (requires approval).',
+  permission: 'users.manage',
+  mode: 'route',
+  module: 'members',
+  fn: 'remove',
+},
       {
         key: 'view',
         label: 'View Member',

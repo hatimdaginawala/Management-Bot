@@ -12,12 +12,7 @@ export async function up(knex) {
     table.bigInteger('user_id').unsigned().notNullable();
     table.string('discord_id', 32).notNullable();
 
-    table
-      .enu('reason', ['THRESHOLD', 'MANUAL'], {
-        useNative: true,
-        enumName: 'removal_requests_reason_enum',
-      })
-      .notNullable();
+table.string('reason', 50).notNullable().defaultTo('MANUAL');
 
     table.integer('strike_count').notNullable();
     table.integer('strike_threshold').notNullable();

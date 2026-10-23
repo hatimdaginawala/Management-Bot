@@ -48,21 +48,29 @@ export async function ensurePresent(data) {
  *
  * Wrapped in a Knex transaction so a partial failure rolls back cleanly.
  */
-export async function ensurePresentBatch(rows) {
+// Only the affected functions — the rest stay as-is.
+
+export async function ensurePresentBatch(rows, trx = null) {
   if (!rows || rows.length === 0) return { created: 0, skipped: 0 };
   return withDbErrors(async () => {
+    const conn = trx ?? db;
     let created = 0;
     let skipped = 0;
-    await db.transaction(async (trx) => {
+
+    // Use a transaction only if none was passed in.
+    const runner = trx ? null : await db.transaction();
+    const useTrx = trx ?? runner;
+
+    try {
       for (const data of rows) {
-        const existing = await trx('attendance')
+        const existing = await useTrx('attendance')
           .where({ event_id: data.eventId, user_id: data.userId })
           .first();
         if (existing) {
           skipped++;
           continue;
         }
-        await trx('attendance').insert({
+        await useTrx('attendance').insert({
           event_id: data.eventId,
           event_type_key: data.eventTypeKey,
           user_id: data.userId,
@@ -74,20 +82,23 @@ export async function ensurePresentBatch(rows) {
         });
         created++;
       }
-    });
+      if (runner) await runner.commit();
+    } catch (err) {
+      if (runner) await runner.rollback();
+      throw err;
+    }
+
     return { created, skipped };
   }, { ...CTX, method: 'ensurePresentBatch' });
 }
 
-/**
- * Delete all attendance rows for an event.
- * Called on cancel.
- */
-export async function deleteByEvent(eventId) {
+export async function deleteByEvent(eventId, trx = db) {
   return withDbErrors(async () => {
-    return db('attendance').where({ event_id: eventId }).delete();
+    return trx('attendance').where({ event_id: eventId }).delete();
   }, { ...CTX, method: 'deleteByEvent' });
 }
+
+
 
 /**
  * Soft-remove a single attendance row (manual removal by admin).

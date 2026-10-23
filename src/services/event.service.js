@@ -1,3 +1,5 @@
+// src/services/event.service.js
+
 import * as eventRepo from '../db/repositories/event.repository.js';
 import * as eventTypeRepo from '../db/repositories/eventType.repository.js';
 import * as eventAttendeeRepo from '../db/repositories/eventAttendee.repository.js';
@@ -94,6 +96,27 @@ async function resolveAttendeeUsers(entries) {
   });
 }
 
+/**
+ * Resolve a cohost spec ({ discordId }) to a full user record + Discord ID.
+ * Returns null if not specified.
+ */
+async function resolveCohost(rawCohost, hostDiscordId) {
+  if (!rawCohost) return null;
+
+  const cohostDiscordId = rawCohost.discordId ? String(rawCohost.discordId) : null;
+  if (!cohostDiscordId) return null;
+  if (cohostDiscordId === hostDiscordId) {
+    throw new ValidationError('The co-host cannot be the same user as the host.');
+  }
+
+  const user = await userRepo.findByDiscordId(cohostDiscordId);
+  return {
+    cohostUserId: user?.id ?? null,
+    cohostDiscordId,
+    cohostDiscordUsername: user?.discord_username ?? null,
+  };
+}
+
 // ============================================================
 //  Cooldown check
 // ============================================================
@@ -126,7 +149,7 @@ async function writeAttendanceForEvent(event, attendees, trx = db) {
     status: 'PRESENT',
   }));
 
-  return attendanceRepo.ensurePresentBatch(rows);
+  return attendanceRepo.ensurePresentBatch(rows, trx);
 }
 
 // ============================================================
@@ -165,6 +188,7 @@ export async function createEvent(actorDiscordId, payload) {
   const {
     eventTypeKey,
     attendees: rawAttendees = [],
+    cohost: rawCohost = null,
     proofUrl,
     notes = '',
   } = payload;
@@ -195,6 +219,7 @@ export async function createEvent(actorDiscordId, payload) {
   }
 
   const host = await userRepo.findByDiscordId(actorDiscordId);
+  const cohost = await resolveCohost(rawCohost, actorDiscordId);
 
   let entries = normalizeAttendees(rawAttendees, actorDiscordId);
   entries = await resolveAttendeeUsers(entries);
@@ -214,6 +239,9 @@ export async function createEvent(actorDiscordId, payload) {
       hostDiscordUsername: host?.discord_username ?? null,
       hostRobloxId: host?.roblox_id ?? null,
       hostRobloxUsername: host?.roblox_username ?? null,
+      cohostUserId: cohost?.cohostUserId ?? null,
+      cohostDiscordId: cohost?.cohostDiscordId ?? null,
+      cohostDiscordUsername: cohost?.cohostDiscordUsername ?? null,
       eventTypeId: eventType.id,
       eventTypeKey: eventType.key,
       proofUrl: proofUrl.trim(),
@@ -226,7 +254,7 @@ export async function createEvent(actorDiscordId, payload) {
         : {}),
     }, trx);
 
-    const attendeeRows = await eventAttendeeRepo.insertMany(created.id, entries);
+    const attendeeRows = await eventAttendeeRepo.insertMany(created.id, entries, trx);
 
     if (status === 'APPROVED') {
       await writeAttendanceForEvent(created, attendeeRows, trx);
@@ -245,12 +273,19 @@ export async function createEvent(actorDiscordId, payload) {
       eventTypeKey: result.event.event_type_key,
       status,
       attendees: entries.length,
+      cohostDiscordId: cohost?.cohostDiscordId ?? null,
       proofUrl: result.event.proof_url,
     },
   });
 
   logger.info(
-    { eventId: result.event.id, host: actorDiscordId, status, attendees: entries.length },
+    {
+      eventId: result.event.id,
+      host: actorDiscordId,
+      cohost: cohost?.cohostDiscordId ?? null,
+      status,
+      attendees: entries.length,
+    },
     'Event created'
   );
 
@@ -281,7 +316,7 @@ export async function approveEvent(actorDiscordId, eventId, { client = null } = 
   }
 
   const attendees = await eventAttendeeRepo.listByEvent(event.id);
-  await writeAttendanceForEvent(event, attendees);
+  await writeAttendanceForEvent(event, attendees, db);
 
   await audit({
     actorId: actorDiscordId,
@@ -301,10 +336,7 @@ export async function approveEvent(actorDiscordId, eventId, { client = null } = 
     extraLine: 'Your event has been approved. Attendance has been credited.',
   });
 
-  return {
-    event: enriched,
-    alreadyApproved: false,
-  };
+  return { event: enriched, alreadyApproved: false };
 }
 
 // ============================================================
@@ -375,10 +407,10 @@ export async function cancelEvent(actorDiscordId, eventId, { reason = null, clie
       cancelledBy: actorDiscordId,
       cancelledAt: new Date(),
       cancellationReason: reason,
-    });
+    }, trx);
 
     if (previousStatus === 'APPROVED') {
-      await attendanceRepo.deleteByEvent(existing.id);
+      await attendanceRepo.deleteByEvent(existing.id, trx);
     }
   });
 
@@ -421,6 +453,7 @@ export async function updateEvent(actorDiscordId, eventId, patch) {
     proofUrl: event.proof_url,
     notes: event.notes,
     attendeeCount: (await eventAttendeeRepo.listByEvent(event.id)).length,
+    cohostDiscordId: event.cohost_discord_id,
   };
 
   let attendeesChanged = false;
@@ -435,6 +468,14 @@ export async function updateEvent(actorDiscordId, eventId, patch) {
   if (patch.notes !== undefined) {
     await eventRepo.updateById(event.id, { notes: String(patch.notes).slice(0, 2000) });
   }
+  if (patch.cohost !== undefined) {
+    const cohost = await resolveCohost(patch.cohost, event.host_discord_id);
+    await eventRepo.updateById(event.id, {
+      cohostUserId: cohost?.cohostUserId ?? null,
+      cohostDiscordId: cohost?.cohostDiscordId ?? null,
+      cohostDiscordUsername: cohost?.cohostDiscordUsername ?? null,
+    });
+  }
   if (patch.attendees !== undefined) {
     if (!Array.isArray(patch.attendees) || patch.attendees.length === 0) {
       throw new ValidationError('Attendees array cannot be empty.');
@@ -446,10 +487,10 @@ export async function updateEvent(actorDiscordId, eventId, patch) {
 
   if (attendeesChanged) {
     await db.transaction(async (trx) => {
-      await eventAttendeeRepo.replaceForEvent(event.id, newEntries);
+      await eventAttendeeRepo.replaceForEvent(event.id, newEntries, trx);
       if (event.status === 'APPROVED') {
-        await attendanceRepo.deleteByEvent(event.id);
-        await writeAttendanceForEvent(event, newEntries);
+        await attendanceRepo.deleteByEvent(event.id, trx);
+        await writeAttendanceForEvent(event, newEntries, trx);
       }
     });
   }
@@ -468,6 +509,7 @@ export async function updateEvent(actorDiscordId, eventId, patch) {
       proofUrl: updated.proof_url,
       notes: updated.notes,
       attendeeCount: attendees.length,
+      cohostDiscordId: updated.cohost_discord_id,
     },
   });
 

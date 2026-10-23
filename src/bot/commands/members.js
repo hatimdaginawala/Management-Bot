@@ -310,7 +310,24 @@ async function assertPermission(interaction, permissionKey) {
   const ok = await permissionService.hasPermission(user.id, permissionKey);
   if (!ok) throw new AuthorizationError('You do not have permission to perform this action.');
 }
+async function startAdminRemoveFlow(interaction, ctx) {
+  await assertPermission(interaction, 'users.manage');
 
+  const menu = new (await import('discord.js')).UserSelectMenuBuilder()
+    .setCustomId('member:remove:user')
+    .setPlaceholder('Select the member to remove')
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  return replyOrUpdate(interaction, {
+    embeds: [infoEmbed({
+      title: 'Remove Member',
+      description: 'Select the member you want to remove. This creates a removal request that must be approved.',
+    })],
+    components: [new (await import('discord.js')).ActionRowBuilder().addComponents(menu)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
 export const HANDLERS = {
   view: handleView,
   list: handleList,
@@ -320,4 +337,5 @@ export const HANDLERS = {
   'pending-removal': handlePendingRemoval,
   rank: handleRank,
   role: handleRole,
+  remove: startAdminRemoveFlow,
 };

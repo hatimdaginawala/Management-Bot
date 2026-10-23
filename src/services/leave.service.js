@@ -8,14 +8,8 @@ import {
 } from '../utils/errors.js';
 import { db } from '../db/client.js';
 import logger from '../config/logger.js';
-
-/**
- * Leave service. Public API unchanged.
- *
- * Idempotency:
- *   - createLeaveRequest wraps check-then-insert in a transaction.
- *   - approve/reject/end/cancel are status CAS operations.
- */
+import { dmLeaveUser } from '../bot/utils/leaveDm.js';
+import { COLORS } from '../bot/embedBuilders.js';
 
 // ============================================================
 //  Create / submit
@@ -45,7 +39,6 @@ export async function createLeaveRequest(discordId, {
   const user = await userRepo.findByDiscordId(discordId);
   if (!user) throw new NotFoundError('User', { discordId });
 
-  // Transaction: check-then-insert is safe against concurrent calls.
   const leave = await db.transaction(async (trx) => {
     const existingPending = await leaveRepo.findPendingForUser(user.id, trx);
     if (existingPending) {
@@ -89,7 +82,7 @@ export async function createLeaveRequest(discordId, {
 //  Review
 // ============================================================
 
-export async function approveLeave(actorId, leaveId, { reason = null } = {}) {
+export async function approveLeave(actorId, leaveId, { reason = null, client = null } = {}) {
   const leave = await leaveRepo.approveAtomic(leaveId, {
     reviewedBy: actorId,
     reason,
@@ -116,11 +109,20 @@ export async function approveLeave(actorId, leaveId, { reason = null } = {}) {
     reason,
   });
 
+  await notifyLeaveUser(client, leave, {
+    title: 'Leave Approved',
+    color: COLORS.SUCCESS,
+    actorId,
+    actorLabel: 'Approved By',
+    reason,
+    extraLine: 'Your leave has been approved. You are exempt from weekly quota for this period.',
+  });
+
   logger.info({ leaveId: leave.id, actorId }, 'Leave approved');
   return { approved: true, alreadyApproved: false, leave };
 }
 
-export async function rejectLeave(actorId, leaveId, { reason } = {}) {
+export async function rejectLeave(actorId, leaveId, { reason, client = null } = {}) {
   if (!reason || reason.trim().length < 3) {
     throw new ValidationError('A reason is required to reject a leave.');
   }
@@ -148,6 +150,15 @@ export async function rejectLeave(actorId, leaveId, { reason } = {}) {
     reason: reason.trim(),
   });
 
+  await notifyLeaveUser(client, leave, {
+    title: 'Leave Rejected',
+    color: COLORS.ERROR,
+    actorId,
+    actorLabel: 'Reviewed By',
+    reason: reason.trim(),
+    extraLine: 'Your leave request was rejected. Contact High Command if you believe this is an error.',
+  });
+
   return leave;
 }
 
@@ -155,7 +166,7 @@ export async function rejectLeave(actorId, leaveId, { reason } = {}) {
 //  End / cancel
 // ============================================================
 
-export async function endLeave(actorId, leaveId, { reason = null } = {}) {
+export async function endLeave(actorId, leaveId, { reason = null, client = null } = {}) {
   const leave = await leaveRepo.endAtomic(leaveId, { reason });
 
   if (!leave) {
@@ -174,10 +185,19 @@ export async function endLeave(actorId, leaveId, { reason = null } = {}) {
     reason,
   });
 
+  await notifyLeaveUser(client, leave, {
+    title: 'Leave Ended',
+    color: COLORS.WARNING,
+    actorId,
+    actorLabel: 'Ended By',
+    reason,
+    extraLine: 'Your leave was ended early. You are once again subject to weekly quota.',
+  });
+
   return { ended: true, leave };
 }
 
-export async function cancelLeave(actorId, leaveId, { reason = null } = {}) {
+export async function cancelLeave(actorId, leaveId, { reason = null, client = null } = {}) {
   const leave = await leaveRepo.cancelAtomic(leaveId, { reason });
 
   if (!leave) {
@@ -253,4 +273,52 @@ export async function hasApprovedLeaveOverlapping(userObjectId, period) {
     end_at: period.endAt,
   });
   return userIds.includes(userObjectId);
+}
+
+// ============================================================
+//  Internal — DM helper
+// ============================================================
+
+async function notifyLeaveUser(client, leave, {
+  title,
+  color,
+  actorId = null,
+  actorLabel = 'Reviewed By',
+  reason = null,
+  extraLine = null,
+} = {}) {
+  if (!client) return;
+  try {
+    // leaveDm expects camelCase fields — the repo returns snake_case.
+    await dmLeaveUser(client, {
+      discordId: leave.discord_id,
+      startAt: leave.start_at,
+      endAt: leave.end_at,
+      reason: leave.reason,
+    }, {
+      title,
+      color,
+      actorId,
+      actorLabel,
+      reason,
+      extraLine,
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err.message, leaveId: leave.id },
+      'Leave DM failed (non-fatal)'
+    );
+  }
+}
+export async function createVoluntaryLeave(discordId, { reason, effectiveAt = null } = {}) {
+  if (!reason || reason.trim().length < 3) {
+    throw new ValidationError('A reason is required (min 3 characters).');
+  }
+
+  const user = await userRepo.findByDiscordId(discordId);
+  if (!user) throw new NotFoundError('User', { discordId });
+
+  // Delegate to removalRequest service — it knows the removal flow
+  const { createVoluntary } = await import('./removalRequest.service.js');
+  return createVoluntary(discordId, { reason: reason.trim(), effectiveAt });
 }

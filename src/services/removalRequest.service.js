@@ -13,28 +13,20 @@ import { REMOVAL_MIN_ADVANCE_DAYS } from '../config/constants.js';
 import { db } from '../db/client.js';
 import logger from '../config/logger.js';
 
-/**
- * Removal request service. Public API unchanged.
- */
-
 const DEFAULT_THRESHOLD = 3;
 
 // ============================================================
-//  Creation
+//  Strike-threshold removals (existing)
 // ============================================================
 
-export async function createFromThreshold(user, {
-  strikeCount,
-  strikeThreshold,
-} = {}) {
+export async function createFromThreshold(user, { strikeCount, strikeThreshold } = {}) {
   if (!user?.id) throw new ValidationError('createFromThreshold requires user.');
 
-  // Transaction: check-then-insert for safe concurrent calls.
   const result = await db.transaction(async (trx) => {
     const existing = await removalRepo.findPendingForUser(user.id, trx);
     if (existing) return { created: false, request: existing };
 
-    const request = await removalRepo.ensurePending({
+    return removalRepo.ensurePending({
       userId: user.id,
       discordId: user.discord_id,
       reason: 'THRESHOLD',
@@ -44,8 +36,6 @@ export async function createFromThreshold(user, {
         'Automatic removal request: reached ' + strikeCount +
         ' active strikes (threshold ' + strikeThreshold + ').',
     }, trx);
-
-    return request;
   });
 
   if (result.created) {
@@ -55,21 +45,14 @@ export async function createFromThreshold(user, {
       category: 'REMOVAL',
       targetType: 'RemovalRequest',
       targetId: result.request.id,
-      after: {
-        discordId: user.discord_id,
-        strikeCount,
-        strikeThreshold,
-      },
+      after: { discordId: user.discord_id, strikeCount, strikeThreshold },
     });
   }
 
   return result;
 }
 
-export async function createManual(actorId, {
-  targetDiscordId,
-  description,
-} = {}) {
+export async function createManual(actorId, { targetDiscordId, description } = {}) {
   if (!targetDiscordId) throw new ValidationError('targetDiscordId is required.');
   if (!description || description.trim().length < 3) {
     throw new ValidationError('A description is required for a manual removal.');
@@ -88,7 +71,6 @@ export async function createManual(actorId, {
     } catch {}
   }
 
-  // Transaction: check-then-insert
   const request = await db.transaction(async (trx) => {
     const existing = await removalRepo.findPendingForUser(user.id, trx);
     if (existing) {
@@ -97,6 +79,7 @@ export async function createManual(actorId, {
     return removalRepo.createManual({
       userId: user.id,
       discordId: user.discord_id,
+      reason: 'ADMIN',
       strikeCount,
       strikeThreshold: threshold,
       description: description.trim(),
@@ -109,10 +92,56 @@ export async function createManual(actorId, {
     category: 'REMOVAL',
     targetType: 'RemovalRequest',
     targetId: request.id,
-    after: { discordId: targetDiscordId, strikeCount },
+    after: { discordId: targetDiscordId, strikeCount, reason: 'ADMIN' },
     reason: description.trim(),
   });
 
+  return request;
+}
+
+// ============================================================
+//  Voluntary departures (NEW)
+// ============================================================
+
+export async function createVoluntary(actorId, {
+  reason,
+  effectiveAt = null,
+} = {}) {
+  if (!reason || reason.trim().length < 3) {
+    throw new ValidationError('A reason is required (min 3 characters).');
+  }
+
+  const user = await userRepo.findByDiscordId(actorId);
+  if (!user) throw new NotFoundError('User', { discordId: actorId });
+
+  const request = await db.transaction(async (trx) => {
+    const existing = await removalRepo.findPendingForUser(user.id, trx);
+    if (existing) {
+      throw new ConflictError(
+        'You already have a pending removal or departure request. Contact High Command.'
+      );
+    }
+    return removalRepo.createManual({
+      userId: user.id,
+      discordId: user.discord_id,
+      reason: 'VOLUNTARY',
+      strikeCount: 0,
+      strikeThreshold: 0,
+      description: reason.trim(),
+    }, trx);
+  });
+
+  await audit({
+    actorId,
+    action: 'removal.voluntary_requested',
+    category: 'REMOVAL',
+    targetType: 'RemovalRequest',
+    targetId: request.id,
+    after: { discordId: actorId, reason: reason.trim() },
+    reason: reason.trim(),
+  });
+
+  logger.info({ discordId: actorId, requestId: request.id }, 'Voluntary departure requested');
   return request;
 }
 
@@ -123,8 +152,17 @@ export async function createManual(actorId, {
 export async function approveRemoval(actorId, requestId, {
   reason = null,
   effectiveAt = null,
+  client = null,
 } = {}) {
-  const minDate = new Date(Date.now() + REMOVAL_MIN_ADVANCE_DAYS * 86_400_000);
+  const existingRequest = await removalRepo.findById(requestId);
+  if (!existingRequest) {
+    throw new NotFoundError('RemovalRequest', { id: String(requestId) });
+  }
+
+  // For voluntary departures, allow immediate effective date.
+  // For everything else, enforce the 3-day minimum.
+  const isVoluntary = existingRequest.reason === 'VOLUNTARY';
+  const minDate = isVoluntary ? new Date() : new Date(Date.now() + REMOVAL_MIN_ADVANCE_DAYS * 86_400_000);
   const targetDate = effectiveAt ? new Date(effectiveAt) : minDate;
 
   if (Number.isNaN(targetDate.getTime())) {
@@ -132,11 +170,12 @@ export async function approveRemoval(actorId, requestId, {
   }
   if (targetDate < minDate) {
     throw new ValidationError(
-      'effectiveAt must be at least ' + REMOVAL_MIN_ADVANCE_DAYS + ' days in the future.'
+      isVoluntary
+        ? 'effectiveAt must not be in the past.'
+        : 'effectiveAt must be at least ' + REMOVAL_MIN_ADVANCE_DAYS + ' days in the future.'
     );
   }
 
-  // Transaction: approve request + set user status SUSPENDED atomically.
   const result = await db.transaction(async (trx) => {
     const request = await removalRepo.approveAtomic(requestId, {
       reviewedBy: actorId,
@@ -173,6 +212,7 @@ export async function approveRemoval(actorId, requestId, {
       status: 'APPROVED',
       removalEffectiveAt: targetDate,
       userStatus: 'SUSPENDED',
+      reason: existingRequest.reason,
     },
     reason,
   });
@@ -185,7 +225,7 @@ export async function approveRemoval(actorId, requestId, {
   return result;
 }
 
-export async function dismissRemoval(actorId, requestId, { reason = null } = {}) {
+export async function dismissRemoval(actorId, requestId, { reason = null, client = null } = {}) {
   const request = await removalRepo.dismissAtomic(requestId, {
     reviewedBy: actorId,
     reason,
@@ -219,7 +259,6 @@ export async function findDueRemovals(asOf = new Date()) {
 }
 
 export async function applyRemoval(requestId, { actorId = 'system' } = {}) {
-  // Transaction: mark applied + transition user + unassign roles + reset quota category.
   const result = await db.transaction(async (trx) => {
     const request = await removalRepo.markAppliedAtomic(requestId, trx);
     if (!request) return { applied: false };
@@ -227,13 +266,13 @@ export async function applyRemoval(requestId, { actorId = 'system' } = {}) {
     const user = await userRepo.findById(request.user_id);
     if (!user) return { applied: false, missingUser: true };
 
-    // Update user status
+    // 1. Status → LEFT_ROBLOX_GROUP
     await userRepo.updateById(user.id, {
       status: 'LEFT_ROBLOX_GROUP',
       lastLeftRobloxAt: new Date(),
     });
 
-    // Unassign every active role
+    // 2. Unassign all internal roles
     const activeAssignments = await roleAssignmentRepo.findActiveForUser(user.id);
     const unassignedKeys = [];
     for (const a of activeAssignments) {
@@ -244,13 +283,22 @@ export async function applyRemoval(requestId, { actorId = 'system' } = {}) {
       unassignedKeys.push(a.role_key);
     }
 
-    // Reset quota category to NONE
+    // 3. Quota category → NONE
     await userRepo.updateById(user.id, { quotaCategory: 'NONE' });
+
+    // 4. Cancel all active strikes
+    const activeStrikes = await strikeRepo.listActiveForUser(user.discord_id);
+    const cancelledStrikes = await strikeRepo.cancelAllActiveForUser(user.id, {
+      resolvedBy: actorId,
+      reason: 'User left the group',
+    });
 
     return {
       applied: true,
       user: { ...user, status: 'LEFT_ROBLOX_GROUP', quota_category: 'NONE' },
       unassignedRoles: unassignedKeys,
+      cancelledStrikes,
+      requestReason: request.reason,
     };
   });
 
@@ -264,6 +312,8 @@ export async function applyRemoval(requestId, { actorId = 'system' } = {}) {
       after: {
         userStatus: 'LEFT_ROBLOX_GROUP',
         unassignedRoles: result.unassignedRoles,
+        cancelledStrikes: result.cancelledStrikes,
+        requestReason: result.requestReason,
       },
     });
 
@@ -272,6 +322,8 @@ export async function applyRemoval(requestId, { actorId = 'system' } = {}) {
         requestId,
         discordId: result.user?.discord_id,
         unassignedRoles: result.unassignedRoles,
+        cancelledStrikes: result.cancelledStrikes,
+        reason: result.requestReason,
       },
       'Removal applied'
     );
@@ -284,11 +336,11 @@ export async function applyRemoval(requestId, { actorId = 'system' } = {}) {
 //  Reads
 // ============================================================
 
-export async function listPendingRemovals({ page = 1, pageSize = 25 } = {}) {
+export async function listPendingRemovals({ page = 1, pageSize = 25, reason = null } = {}) {
   page = Math.max(1, Number(page) || 1);
   pageSize = Math.min(100, Math.max(1, Number(pageSize) || 25));
 
-  const { items, total } = await removalRepo.listPending({ page, pageSize });
+  const { items, total } = await removalRepo.listPending({ page, pageSize, reason });
 
   return {
     items,

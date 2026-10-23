@@ -13,10 +13,23 @@ export async function execute(interaction) {
   const eventTypeKey = interaction.fields.getTextInputValue('eventTypeKey').trim().toLowerCase();
   const attendeesRaw = interaction.fields.getTextInputValue('attendees').trim();
   const proofUrl = interaction.fields.getTextInputValue('proofUrl').trim();
-  const notesRaw = interaction.fields.getTextInputValue('notes');
+  const notesRaw = interaction.fields.getTextInputValue('notes') ?? '';
   const notes = notesRaw ? notesRaw.trim() : '';
 
+  const cohostRaw = (interaction.fields.getTextInputValue('cohost') ?? '').trim();
+
   const attendees = parseAttendees(attendeesRaw);
+  const cohostDiscordId = parseCohost(cohostRaw);
+
+  if (cohostDiscordId && cohostDiscordId === interaction.user.id) {
+    return interaction.reply({
+      embeds: [errorEmbed({
+        title: 'Invalid Co-host',
+        description: 'You cannot be the co-host of your own event.',
+      })],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 
   if (attendees.length === 0) {
     return interaction.reply({
@@ -30,22 +43,28 @@ export async function execute(interaction) {
   const event = await eventService.createEvent(interaction.user.id, {
     eventTypeKey,
     attendees,
+    cohost: cohostDiscordId ? { discordId: cohostDiscordId } : null,
     proofUrl,
     notes,
   });
 
   if (event.status === 'APPROVED') {
+    const fields = [
+      { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
+      { name: 'Hosted By', value: '<@' + event.host_discord_id + '>', inline: true },
+      { name: 'Attendees Credited', value: String(event.attendeeEntries.length), inline: true },
+      { name: 'Logged', value: '<t:' + Math.floor(new Date(event.created_at).getTime() / 1000) + ':R>', inline: true },
+      { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
+    ];
+    if (event.cohost_discord_id) {
+      fields.push({ name: 'Co-host', value: '<@' + event.cohost_discord_id + '>', inline: true });
+    }
+
     return interaction.editReply({
       embeds: [successEmbed({
         title: 'Event Logged',
         description: 'Your event was recorded and approved automatically.',
-        fields: [
-          { name: 'Type', value: '`' + event.event_type_key + '`', inline: true },
-          { name: 'Hosted By', value: '<@' + event.host_discord_id + '>', inline: true },
-          { name: 'Attendees Credited', value: String(event.attendeeEntries.length), inline: true },
-          { name: 'Logged', value: '<t:' + Math.floor(new Date(event.created_at).getTime() / 1000) + ':R>', inline: true },
-          { name: 'Proof', value: '<' + event.proof_url + '>', inline: false },
-        ],
+        fields,
       })],
     });
   }
@@ -57,10 +76,7 @@ export async function execute(interaction) {
     return interaction.editReply({
       embeds: [infoEmbed({
         title: 'Event Submitted (Pending Review)',
-        description:
-          'Your event has been submitted for approval. ' +
-          'However, the approval channel is not configured — ' +
-          'please notify High Command to review it manually.',
+        description: 'Your event has been submitted for approval. However, the approval channel is not configured — please notify High Command to review it manually.',
       })],
     });
   }
@@ -82,7 +98,12 @@ export async function execute(interaction) {
       )
       .setTimestamp(new Date());
 
-    if (event.notes) reviewEmbed.addFields({ name: 'Notes', value: event.notes, inline: false });
+    if (event.cohost_discord_id) {
+      reviewEmbed.addFields({ name: 'Co-host', value: '<@' + event.cohost_discord_id + '>', inline: true });
+    }
+    if (event.notes) {
+      reviewEmbed.addFields({ name: 'Notes', value: event.notes, inline: false });
+    }
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('event:approve:' + event.id).setLabel('Approve').setStyle(ButtonStyle.Success),
@@ -108,10 +129,7 @@ export async function execute(interaction) {
     return interaction.editReply({
       embeds: [infoEmbed({
         title: 'Event Submitted (Pending Review)',
-        description:
-          'Your event has been submitted for approval. ' +
-          'The bot could not post it to the approval channel — ' +
-          'please notify High Command manually.',
+        description: 'Your event has been submitted for approval. The bot could not post it to the approval channel — please notify High Command manually.',
       })],
     });
   }
@@ -138,5 +156,15 @@ function parseAttendees(raw) {
       if (!seen.has(key)) { seen.add(key); out.push({ robloxUsername: part }); }
     }
   }
+
   return out;
+}
+
+function parseCohost(raw) {
+  if (!raw) return null;
+  // Accept "<@123>", "<@!123>", or "123"
+  const mention = /^<@!?(\d{15,25})>$/.exec(raw);
+  if (mention) return mention[1];
+  if (/^\d{15,25}$/.test(raw)) return raw;
+  return null;   // malformed → treat as no cohost
 }

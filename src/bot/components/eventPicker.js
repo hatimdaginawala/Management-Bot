@@ -34,10 +34,12 @@ export async function showEventPicker(interaction, {
       100
     );
 
-    const description = truncatePlain(
-      'by @' + hostName + ' · logged ' + loggedAgo + ' · ' + e.status,
-      100
-    );
+const description = truncatePlain(
+  'by @' + hostName
+    + (e.cohost_discord_id ? ' + cohost' : '')
+    + ' · logged ' + loggedAgo + ' · ' + e.status,
+  100
+);
 
     return { label, description, value: String(e.id) };
   });
@@ -78,11 +80,20 @@ export function formatEventSummary(event) {
   const ts = Math.floor(new Date(event.created_at).getTime() / 1000);
   const attendeeCount = (event.attendeeEntries || []).length;
 
-  return [
+  const lines = [
     '**' + event.event_type_key + '**',
     'Host: <@' + event.host_discord_id + '>',
+  ];
+
+  if (event.cohost_discord_id) {
+    lines.push('Co-host: <@' + event.cohost_discord_id + '>');
+  }
+
+  lines.push(
     'Created: <t:' + ts + ':R>',
     'Attendees: ' + attendeeCount,
-    'Status: `' + event.status + '`',
-  ].join('\n');
+    'Status: `' + event.status + '`'
+  );
+
+  return lines.join('\n');
 }
