@@ -10,17 +10,25 @@ import logger from '../config/logger.js';
  * services to switch to in M3.
  */
 
+
 const connection = {
   host: config.mysql.host,
-  port: config.mysql.port,
+  port: Number(config.mysql.port || 4000),
   user: config.mysql.user,
   password: config.mysql.password,
   database: config.mysql.database,
+
+  // Enable TLS for TiDB Cloud.
+  ssl: {
+    minVersion: 'TLSv1.2',
+  },
+
   charset: 'utf8mb4',
   timezone: 'Z',
   supportBigNumbers: true,
   bigNumberStrings: false,
 };
+
 
 export const db = knex({
   client: 'mysql2',
